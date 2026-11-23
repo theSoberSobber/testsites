@@ -325,20 +325,14 @@ async def stream_download(writer, qs, head_only):
 <tr><td><code>?chunk=N</code></td><td>write size per chunk (default 65536)</td></tr>
 <tr><td><code>?pattern=seq|zero|random</code></td><td>payload pattern</td></tr>
 <tr><td><code>?rate=N</code></td><td>throttle to N bytes/second</td></tr>
-<tr><td><a href="?bytes=1048576&amp;filename=demo.pdf">?filename=demo.pdf</a></td><td>Content-Type + Content-Disposition from the filename</td></tr>
-<tr><td><code>?ext=pdf</code></td><td>shorthand: same as filename=probe.pdf</td></tr>
+<tr><td><a href="?bytes=1048576&amp;filename=demo.pdf">?filename=demo.pdf</a></td><td>Content-Type + Content-Disposition from the filename (pdf, zip, mp4, …)</td></tr>
 </table>
 <pre>curl -s -o /dev/null -w '%{{size_download}}\\n' "{site_url('download')}?bytes=104857600"
 curl -s "{site_url('download')}?infinite=1" | pv &gt; /dev/null</pre>""")
         await respond(writer, 200, body=body.encode(), head_only=head_only)
         return {"stream": "landing"}
     sent = 0
-    ext = (qs.get("ext", [""])[0] or "").strip().lstrip(".").lower()
-    filename = (qs.get("filename", [""])[0] or qs.get("name", [""])[0] or "").strip()
-    if not filename and ext:
-        filename = "probe." + ext
-    elif filename and not ext and "." in filename:
-        ext = filename.rsplit(".", 1)[-1].lower()
+    filename = (qs.get("filename", [""])[0] or "").strip()
     ctype = (mimetypes.guess_type(filename)[0] if filename else None) or "application/octet-stream"
     headers = {"Content-Type": ctype,
                "Cache-Control": "no-store",

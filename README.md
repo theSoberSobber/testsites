@@ -47,7 +47,7 @@ Upload query params: `chunk` (bytes per digest, default 1 MiB), `hash`
 (`md5|sha1|sha512` in addition to sha256), `format=html|json`.
 Download query params: `bytes`, `infinite`, `chunk`, `pattern=seq|zero|random`,
 `rate` (bytes/sec), `filename=demo.pdf` (sets `Content-Type` and
-`Content-Disposition` from the extension), `ext=pdf` (shorthand).
+`Content-Disposition` from the extension).
 
 ## Logging
 
