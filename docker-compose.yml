@@ -5,11 +5,31 @@ services:
     container_name: testsites
     restart: unless-stopped
     ports:
-      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:8080:8080"      # only the local cloudflared can reach it
     volumes:
       - /var/log/testsites:/var/log/testsites
     environment:
       LOG_DIR: /var/log/testsites
-      MAX_BYTES: "67108864"   # rotate access.jsonl at 64 MiB
-      KEEP_ARCHIVES: "20"     # then keep 20 gzipped archives
-      INTERVAL: "10"          # check every 10s
+      MAX_BYTES: "67108864"         # rotate access.jsonl at 64 MiB
+      KEEP_ARCHIVES: "20"           # keep 20 gzipped archives
+      INTERVAL: "10"
+      PYTHONDONTWRITEBYTECODE: "1"
+    user: "1001:1001"
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /run
+      - /service/testsites/supervise:uid=1001,gid=1001
+      - /service/accesslog-rotate/supervise:uid=1001,gid=1001
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 512m
+    pids_limit: 256
+    cpus: 1.5
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"

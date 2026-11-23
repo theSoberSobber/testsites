@@ -14,8 +14,16 @@ COPY rotate-access-log.sh /usr/local/bin/rotate-access-log.sh
 RUN chmod +x /usr/local/bin/rotate-access-log.sh \
             /service/testsites/run /service/testsites/log/run \
             /service/accesslog-rotate/run /service/accesslog-rotate/log/run \
+ && chmod -R a+rX /service /app \
+ && chmod a+rx /usr/local/bin/rotate-access-log.sh \
  && mkdir -p /var/log/testsites/archives \
-             /var/log/testsites/svc/testsites /var/log/testsites/svc/rotate
+             /var/log/testsites/svc/testsites /var/log/testsites/svc/rotate \
+ && groupadd -g 1001 app \
+ && useradd -u 1001 -g 1001 -M -s /usr/sbin/nologin app \
+ && chown -R 1001:1001 /var/log/testsites
+
+# daemontools does not need root; bind 8080 (>1024) needs no privileges.
+USER 1001:1001
 
 ENV LOG_DIR=/var/log/testsites \
     MAX_BYTES=67108864 \

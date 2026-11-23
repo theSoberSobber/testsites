@@ -9,6 +9,7 @@ import base64
 import datetime
 import gzip
 import hashlib
+import html
 import json
 import mimetypes
 import os
@@ -24,6 +25,9 @@ LOG_DIR = os.environ.get("LOG_DIR", "/home/pavit/testsites/logs")
 LOG_PATH = os.path.join(LOG_DIR, "access.jsonl")
 MAX_HEADER = 2048
 CHUNK = 1024 * 1024
+MAX_CONN = 200
+MAX_WS_FRAME = 4 * 1024 * 1024
+ACTIVE = 0
 
 REASONS = {
     200: "OK", 201: "Created", 204: "No Content", 301: "Moved Permanently",
@@ -135,10 +139,13 @@ async def respond(writer, status, headers=None, body=b"", head_only=False):
     headers.setdefault("Date", datetime.datetime.now(datetime.timezone.utc).strftime(
         "%a, %d %b %Y %H:%M:%S GMT"))
     headers.setdefault("Connection", "close")
+    headers.setdefault("X-Robots-Tag", "noindex, nofollow")
+    headers.setdefault("X-Content-Type-Options", "nosniff")
     if body and "Content-Type" not in headers:
         headers["Content-Type"] = "text/html; charset=utf-8"
     if body and "Content-Length" not in headers:
         headers["Content-Length"] = str(len(body))
+    writer.responded = True
     out = [f"HTTP/1.1 {status} {REASONS.get(status, 'OK')}"]
     out += [f"{k}: {v}" for k, v in headers.items()]
     writer.write(("\r\n".join(out) + "\r\n\r\n").encode("latin-1"))
@@ -179,7 +186,7 @@ INDEX_ITEMS = [
     ("gui", "GUI upload", "Browser form upload (multipart), streamed, never written to disk"),
     ("download", "Download / sink", "Content-Length of any size, or truly infinite chunked stream"),
     ("ws", "WebSocket echo", "ws:// and wss://, text + binary echo, ping/pong"),
-    ("headers", "Header echo", "JSON dump of every request header as Cloudflare forwarded it"),
+    ("echo", "Echo", "Everything we see: method, path, query, headers, cookies, body preview"),
     ("ip", "Check IP", "Your IPv4/IPv6 as seen by the edge, plus socket peer"),
     ("tools", "Proxy tools", "delay, status codes, gzip, redirects, cookies, SSE, method echo"),
 ]
@@ -238,7 +245,7 @@ def fmt_bytes(n):
 
 async def stream_upload(reader, writer, headers, method, host, qs, head_only, path):
     chunk_size = int(qs.get("chunk", ["1048576"])[0])
-    chunk_size = max(1024, min(chunk_size, 64 * 1024 * 1024))
+    chunk_size = max(1024, min(chunk_size, 2 * 1024 * 1024))
     algos = {"sha256": hashlib.sha256()}
     extra = (qs.get("hash", [""])[0] or "").lower()
     if extra in ("md5", "sha1", "sha512", "sha256"):
@@ -332,7 +339,7 @@ curl -s "{site_url('download')}?infinite=1" | pv &gt; /dev/null</pre>""")
         await respond(writer, 200, body=body.encode(), head_only=head_only)
         return {"stream": "landing"}
     sent = 0
-    filename = (qs.get("filename", [""])[0] or "").strip()
+    filename = safe_filename(qs.get("filename", [""])[0])
     ctype = (mimetypes.guess_type(filename)[0] if filename else None) or "application/octet-stream"
     headers = {"Content-Type": ctype,
                "Cache-Control": "no-store",
@@ -341,6 +348,7 @@ curl -s "{site_url('download')}?infinite=1" | pv &gt; /dev/null</pre>""")
         headers["Content-Disposition"] = f'attachment; filename="{filename}"'
     if infinite:
         headers["Transfer-Encoding"] = "chunked"
+        writer.responded = True
         head = b"HTTP/1.1 200 OK\r\n" + b"".join(
             f"{k}: {v}\r\n".encode() for k, v in headers.items()) + b"\r\n"
         writer.write(head)
@@ -369,6 +377,22 @@ curl -s "{site_url('download')}?infinite=1" | pv &gt; /dev/null</pre>""")
     except (ConnectionResetError, BrokenPipeError):
         pass
     return {"stream": "finite", "declared": total_target, "bytes_sent": sent, "pattern": pattern}
+
+
+def safe_filename(raw):
+    """Never let request data reach a response header verbatim (CRLF injection)."""
+    name = re.sub(r'[\r\n"\\\x00-\x1f]', "", raw or "").strip()
+    name = name.replace("/", "_").replace("\\", "_")
+    return name[:128]
+
+
+def parse_cookies(raw):
+    out = {}
+    for part in (raw or "").split(";"):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            out[k.strip()[:64]] = v.strip()[:512]
+    return out
 
 
 def client_ip(headers):
@@ -431,6 +455,7 @@ async def ws_session(reader, writer, headers, host, path):
         await respond(writer, 400, body=b"expected websocket upgrade\n")
         return {"ws": "bad_handshake"}
     accept = base64.b64encode(hashlib.sha1((key + WS_GUID).encode()).digest()).decode()
+    writer.responded = True
     writer.write(("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
                   "Connection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n").encode())
     await writer.drain()
@@ -456,6 +481,13 @@ async def ws_session(reader, writer, headers, host, path):
                 tx += len(data)
                 writer.write(ws_frame(opcode, data))
                 await writer.drain()
+    except ValueError:
+        try:
+            writer.write(ws_frame(8, struct.pack("!H", 1009)))
+            await writer.drain()
+        except Exception:
+            pass
+        log(event="ws_reject", host=host, reason="frame_too_large")
     except (asyncio.IncompleteReadError, ConnectionResetError, BrokenPipeError):
         pass
     except Exception as exc:
@@ -473,6 +505,8 @@ async def read_ws_frame(reader):
         length = struct.unpack("!H", await reader.readexactly(2))[0]
     elif length == 127:
         length = struct.unpack("!Q", await reader.readexactly(8))[0]
+    if length > MAX_WS_FRAME:
+        raise ValueError(f"frame too large: {length}")
     mask = await reader.readexactly(4) if masked else None
     payload = await reader.readexactly(length) if length else b""
     if mask:
@@ -506,6 +540,16 @@ def route(host):
 
 
 async def handle(reader, writer):
+    global ACTIVE
+    ACTIVE += 1
+    if ACTIVE > MAX_CONN:
+        ACTIVE -= 1
+        try:
+            await respond(writer, 503, body=b"too many connections\n")
+            writer.close()
+        except Exception:
+            pass
+        return
     peer = writer.get_extra_info("peername")
     started = time.monotonic()
     meta = {"status": None, "extra": {}, "bytes": 0}
@@ -563,7 +607,7 @@ curl -s -T big.iso "{site_url('upload')}?hash=md5"</pre>
 
         elif site == "gui":
             if method == "POST":
-                meta["extra"] = await gui_upload(reader, headers, host, path)
+                meta["extra"] = await gui_upload(reader, writer, headers, host, path)
                 meta["status"] = 200
             else:
                 meta["status"] = 200
@@ -577,12 +621,21 @@ curl -s -T big.iso "{site_url('upload')}?hash=md5"</pre>
                 meta["status"] = 200
                 meta["extra"] = await stream_download(writer, qs, head_only)
 
-        elif site == "headers":
+        elif site in ("echo", "headers"):
             meta["status"] = 200
+            preview = bytearray()
+            async for data in body_iter(reader, headers):
+                if len(preview) < 65536:
+                    preview += data[: 65536 - len(preview)]
             await json_respond(writer, 200, {
-                "method": method, "path": path, "query": parts.query,
+                "method": method, "url": target, "path": path,
+                "query_raw": parts.query, "query": qs,
                 "http_version": version, "host": host,
-                "headers": headers, "client": ip_report(headers, peer),
+                "headers": headers,
+                "cookies": parse_cookies(headers.get("cookie")),
+                "client": ip_report(headers, peer),
+                "body_bytes": len(preview),
+                "body_preview_b64": base64.b64encode(bytes(preview)).decode(),
             }, head_only)
 
         elif site == "ip":
@@ -606,7 +659,14 @@ curl -s -T big.iso "{site_url('upload')}?hash=md5"</pre>
     except Exception as exc:
         meta["status"] = 500
         log(event="error", host=host, path=path, error=repr(exc))
+        if not getattr(writer, "responded", False):
+            try:
+                await respond(writer, 500, {"Content-Type": "application/json"},
+                              b'{"error": "internal"}', False)
+            except Exception:
+                pass
     finally:
+        ACTIVE -= 1
         dur = round((time.monotonic() - started) * 1000, 1)
         log(event="response", host=host, path=path, method=method, status=meta["status"],
             duration_ms=dur, resp_bytes=meta["bytes"], detail=meta["extra"])
@@ -617,7 +677,7 @@ curl -s -T big.iso "{site_url('upload')}?hash=md5"</pre>
             pass
 
 
-async def gui_upload(reader, headers, host, path):
+async def gui_upload(reader, writer, headers, host, path):
     total = 0
     h = hashlib.sha256()
     head = bytearray()
@@ -629,7 +689,7 @@ async def gui_upload(reader, headers, host, path):
             head += data[: 16384 - len(head)]
     names = re.findall(rb'filename="([^"]*)"', bytes(head))
     elapsed = (time.monotonic() - started) * 1000
-    files = [n.decode("utf-8", "replace") for n in names]
+    files = [html.escape(n.decode("utf-8", "replace")) for n in names]
     body = f"""
 <h1>Upload complete</h1>
 <table>
@@ -681,7 +741,7 @@ async def tools(reader, writer, headers, method, path, qs, head_only):
         return {"tool": "status", "code": code, "status": code}
 
     if path == "/gzip":
-        kb = min(int(q("kb", "64") or 64), 65536)
+        kb = min(int(q("kb", "64") or 64), 4096)
         payload = (b"testsites gzip probe 0123456789\n" * (kb * 1024 // 33 + 1))[: kb * 1024]
         gz = gzip.compress(payload, 6)
         await respond(writer, 200, {"Content-Type": "text/plain; charset=utf-8",
@@ -708,6 +768,7 @@ async def tools(reader, writer, headers, method, path, qs, head_only):
 
     if path == "/sse":
         n = min(int(q("n", "5") or 5), 1000)
+        writer.responded = True
         writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
                      b"Cache-Control: no-store\r\nConnection: close\r\n\r\n")
         for i in range(n):
@@ -724,6 +785,7 @@ async def tools(reader, writer, headers, method, path, qs, head_only):
         kbps = max(float(q("kbps", "8") or 8), 0.1)
         chunk = int(kbps * 1024 / 10)
         steps = int(seconds * 10)
+        writer.responded = True
         writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n"
                      b"Transfer-Encoding: chunked\r\nCache-Control: no-store\r\n\r\n")
         total = 0
