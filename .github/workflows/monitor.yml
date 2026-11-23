@@ -156,20 +156,28 @@ jobs:
           print(f"- GUI multipart accepted {n} bytes (envelope included)")
           PY
 
-      - name: Container vitals and storage headroom
+      - name: Health and storage headroom
         shell: bash
+        env:
+          HEALTH_TOKEN: ${{ secrets.HEALTH_TOKEN }}
         run: |
           set -euo pipefail
-          curl -sS --max-time 20 -A "$UA" -H "X-Monitor: $TAG" \
+          hdr=()
+          if [ -n "${HEALTH_TOKEN:-}" ]; then hdr=(-H "X-Health-Token: $HEALTH_TOKEN"); fi
+          curl -sS --max-time 20 -A "$UA" -H "X-Monitor: $TAG" "${hdr[@]}" \
             "https://testsites.$BASE_DOMAIN/health" > /tmp/health.json
           cat /tmp/health.json | tee -a "$GITHUB_STEP_SUMMARY"
           python3 - <<'PY'
-          import json
+          import json, os
           h = json.load(open("/tmp/health.json"))
-          assert h["ok"] is True
-          assert h["disk"]["free_pct"] > 5, h["disk"]
-          assert (h["rss_kb"] or 0) < 400000, h["rss_kb"]
-          assert h["active_conns"] < h["max_conns"], h
+          assert h.get("ok") is True
+          if os.environ.get("HEALTH_TOKEN"):
+              assert h["disk"]["free_pct"] > 5, h["disk"]
+              assert (h["rss_kb"] or 0) < 400000, h["rss_kb"]
+              assert h["active_conns"] < h["max_conns"], h
+              print("vitals verified")
+          else:
+              print("token secret not set: liveness only")
           PY
 
       - name: Report

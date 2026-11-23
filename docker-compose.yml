@@ -4,15 +4,20 @@ services:
     image: testsites:latest
     container_name: testsites
     restart: unless-stopped
-    ports:
-      - "127.0.0.1:8080:8080"      # only the local cloudflared can reach it
+    # no published ports and no egress: reachable only by cloudflared
+    networks:
+      - internal
     volumes:
       - /var/log/testsites:/var/log/testsites
     environment:
       LOG_DIR: /var/log/testsites
-      MAX_BYTES: "67108864"         # rotate access.jsonl at 64 MiB
-      KEEP_ARCHIVES: "20"           # keep 20 gzipped archives
+      MAX_BYTES: "67108864"
+      KEEP_ARCHIVES: "20"
       INTERVAL: "10"
+      MIN_FREE_MB: "1024"
+      MAX_ARCHIVE_MB: "2048"
+      MAX_STREAM_MB: "256"
+      DL_RATE_MBPS: "16"
       PYTHONDONTWRITEBYTECODE: "1"
     user: "1001:1001"
     read_only: true
@@ -20,16 +25,34 @@ services:
       - /tmp
       - /run
       - /service/testsites/supervise:uid=1001,gid=1001
+      - /service/testsites/log/supervise:uid=1001,gid=1001
       - /service/accesslog-rotate/supervise:uid=1001,gid=1001
-    cap_drop:
+      - /service/accesslog-rotate/log/supervise:uid=1001,gid=1001    cap_drop:
       - ALL
     security_opt:
       - no-new-privileges:true
     mem_limit: 512m
     pids_limit: 256
     cpus: 1.5
-    logging:
-      driver: json-file
-      options:
-        max-size: 10m
-        max-file: "3"
+
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    container_name: testsites-tunnel
+    restart: unless-stopped
+    command: tunnel --no-autoupdate --config /etc/cloudflared/config.yml run
+    volumes:
+      - /opt/testsites-tunnel:/etc/cloudflared:ro
+    networks:
+      - internal
+      - egress
+    read_only: true
+    tmpfs:
+      - /tmp    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+networks:
+  internal:
+    internal: true      # app cannot reach the LAN or the internet
+  egress: {}            # only cloudflared gets a route out

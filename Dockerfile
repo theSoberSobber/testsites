@@ -31,6 +31,8 @@ ENV LOG_DIR=/var/log/testsites \
     INTERVAL=10 \
     MIN_FREE_MB=1024 \
     MAX_ARCHIVE_MB=2048 \
+    MAX_STREAM_MB=256 \
+    DL_RATE_MBPS=16 \
     PORT=8080
 
 EXPOSE 8080

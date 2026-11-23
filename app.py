@@ -9,6 +9,7 @@ import base64
 import datetime
 import gzip
 import hashlib
+import hmac
 import html
 import json
 import mimetypes
@@ -29,6 +30,54 @@ MAX_CONN = 200
 MAX_WS_FRAME = 4 * 1024 * 1024
 ACTIVE = 0
 STARTED_AT = time.monotonic()
+
+# --- abuse limits: this box sits on a home uplink -------------------------
+MAX_STREAM_BYTES = int(os.environ.get("MAX_STREAM_MB", "256")) * 1024 * 1024
+HEALTH_TOKEN = os.environ.get("HEALTH_TOKEN", "")
+RATE_WINDOW = 60.0          # seconds
+RATE_MAX = 120              # requests per window per IP
+PER_IP_CONN = 8             # concurrent requests per IP
+DL_RATE_MBPS = float(os.environ.get("DL_RATE_MBPS", "16"))  # global egress cap
+IP_STATE = {}
+IP_CONN = {}
+
+
+class TokenBucket:
+    """Shared egress throttle so no number of clients can fill the uplink."""
+
+    def __init__(self, mbytes_per_sec):
+        self.rate = mbytes_per_sec * 1024 * 1024
+        self.burst = max(self.rate * 0.25, 256 * 1024)
+        self.tokens = self.burst
+        self.ts = time.monotonic()
+
+    async def take(self, n):
+        while True:
+            now = time.monotonic()
+            self.tokens = min(self.burst, self.tokens + (now - self.ts) * self.rate)
+            self.ts = now
+            if self.tokens >= n:
+                self.tokens -= n
+                return
+            await asyncio.sleep(min(0.25, (n - self.tokens) / self.rate))
+
+
+DOWNLOAD_BUCKET = TokenBucket(DL_RATE_MBPS)
+
+
+def allow_request(ip):
+    """Per-IP request budget, cheap enough to keep in memory."""
+    now = time.monotonic()
+    window, count = IP_STATE.get(ip, (now, 0))
+    if now - window > RATE_WINDOW:
+        window, count = now, 0
+    count += 1
+    IP_STATE[ip] = (window, count)
+    if len(IP_STATE) > 20000:  # forget idle clients instead of leaking memory
+        for k, (w, _) in list(IP_STATE.items()):
+            if now - w > RATE_WINDOW:
+                IP_STATE.pop(k, None)
+    return count <= RATE_MAX
 
 REASONS = {
     200: "OK", 201: "Created", 204: "No Content", 301: "Moved Permanently",
@@ -140,7 +189,6 @@ async def respond(writer, status, headers=None, body=b"", head_only=False):
     headers.setdefault("Date", datetime.datetime.now(datetime.timezone.utc).strftime(
         "%a, %d %b %Y %H:%M:%S GMT"))
     headers.setdefault("Connection", "close")
-    headers.setdefault("X-Robots-Tag", "noindex, nofollow")
     headers.setdefault("X-Content-Type-Options", "nosniff")
     if body and "Content-Type" not in headers:
         headers["Content-Type"] = "text/html; charset=utf-8"
@@ -181,11 +229,29 @@ input[type=file]{{color:#c9d1d9}} button{{background:#238636;border:0;color:#fff
 </style>{extra_head}</head><body>{body}</body></html>"""
 
 
+PRIVACY_HTML = html_page("privacy policy", """
+<h1>privacy policy</h1>
+<p><b>Assume everything is logged.</b></p>
+<p>Every request that reaches this site may be written to a JSONL file: the URL,
+all the headers, the cookies you brought, your IP address as Cloudflare sees it,
+your user agent, and a short sample of the request body. Uploads are hashed and
+a few hundred leading bytes are kept; the rest is thrown away.</p>
+<p>What happens to those logs is, honestly, undecided. They might get analysed.
+They might just sit there. They will probably be eaten by the log rotation, which
+has a two-gigabyte appetite and no sentimentality.</p>
+<p>So do not send anything you would not want a stranger's laptop to remember.
+No passwords, no tokens, no private keys, no diary entries. This is a test site
+running on somebody's home internet, not a bank.</p>
+<p>No analytics, no ads, no third-party trackers. The only cookies here are the
+ones you bring and the ones this server echoes back to show that it can.</p>
+<p><a href="/">back to the index</a></p>""")
+
+
 # -------------------------------------------------------------------- sites ---
 INDEX_ITEMS = [
     ("upload", "Streaming upload", "POST any body size; memory only, incremental hash, per-chunk digests"),
     ("gui", "GUI upload", "Browser form upload (multipart), streamed, never written to disk"),
-    ("download", "Download / sink", "Content-Length of any size, or truly infinite chunked stream"),
+    ("download", "Download / sink", f"Content-Length up to {MAX_STREAM_BYTES // (1024*1024)} MiB, or a capped chunked stream"),
     ("ws", "WebSocket echo", "ws:// and wss://, text + binary echo, ping/pong"),
     ("echo", "Echo", "Everything we see: method, path, query, headers, cookies, body preview"),
     ("ip", "Check IP", "Your IPv4/IPv6 as seen by the edge, plus socket peer"),
@@ -216,7 +282,8 @@ curl -s "{site_url('download')}?infinite=1" | pv &gt; /dev/null
 
 # exactly 100 MiB
 curl -s -o /dev/null -w '%{{size_download}}\\n' "{site_url('download')}?bytes=104857600"</pre>
-<p class="muted">Every request is logged to <code>{LOG_PATH}</code> as JSONL.</p>""")
+<p class="muted">Every request is logged as JSONL. <a href="/privacy">Privacy policy</a>:
+assume everything is logged.</p>""")
 
 
 def upload_json(**kw):
@@ -349,6 +416,13 @@ async def stream_download(writer, qs, head_only):
     rate = float(qs.get("rate", ["0"])[0] or 0)
     infinite = qs.get("infinite", ["0"])[0] in ("1", "true", "yes")
     total_target = int(qs["bytes"][0]) if "bytes" in qs else 0
+    if total_target > MAX_STREAM_BYTES:
+        await json_respond(writer, 400, {
+            "error": "requested stream too large",
+            "max_bytes": MAX_STREAM_BYTES,
+            "max_mb": MAX_STREAM_BYTES // (1024 * 1024),
+        })
+        return {"stream": "rejected", "requested": total_target, "status": 400}
     if not infinite and "bytes" not in qs:
         body = html_page("download", f"""
 <h1>Download / sink</h1>
@@ -356,10 +430,12 @@ async def stream_download(writer, qs, head_only):
 <table>
 <tr><th>Query</th><th>Behaviour</th></tr>
 <tr><td><a href="?bytes=1048576">?bytes=N</a></td><td>exactly N bytes with Content-Length</td></tr>
-<tr><td><a href="?infinite=1">?infinite=1</a></td><td>endless chunked stream</td></tr>
+<tr><td><a href="?infinite=1">?infinite=1</a></td><td>chunked stream, cut off at the {MAX_STREAM_BYTES // (1024*1024)} MiB cap</td></tr>
 <tr><td><code>?chunk=N</code></td><td>write size per chunk (default 65536)</td></tr>
 <tr><td><code>?pattern=seq|zero|random</code></td><td>payload pattern</td></tr>
-<tr><td><code>?rate=N</code></td><td>throttle to N bytes/second</td></tr>
+<tr><td><code>?rate=N</code></td><td>extra per-stream throttle, N bytes/second</td></tr>
+<tr><td>hard caps</td><td>{MAX_STREAM_BYTES // (1024*1024)} MiB per stream, {DL_RATE_MBPS:g} MiB/s shared egress,
+{RATE_MAX} requests/{RATE_WINDOW:.0f}s and {PER_IP_CONN} concurrent per IP</td></tr>
 <tr><td><a href="?bytes=1048576&amp;filename=demo.pdf">?filename=demo.pdf</a></td><td>Content-Type + Content-Disposition from the filename (pdf, zip, mp4, …)</td></tr>
 </table>
 <pre>curl -s -o /dev/null -w '%{{size_download}}\\n' "{site_url('download')}?bytes=104857600"
@@ -381,15 +457,20 @@ curl -s "{site_url('download')}?infinite=1" | pv &gt; /dev/null</pre>""")
             f"{k}: {v}\r\n".encode() for k, v in headers.items()) + b"\r\n"
         writer.write(head)
         try:
-            while True:
-                writer.write(b"%x\r\n" % len(block) + block + b"\r\n")
+            while sent < MAX_STREAM_BYTES:
+                piece = block[: min(len(block), MAX_STREAM_BYTES - sent)]
+                await DOWNLOAD_BUCKET.take(len(piece))
+                writer.write(b"%x\r\n" % len(piece) + piece + b"\r\n")
                 await writer.drain()
-                sent += len(block)
+                sent += len(piece)
                 if rate:
-                    await asyncio.sleep(len(block) / rate)
+                    await asyncio.sleep(len(piece) / rate)
+            writer.write(b"0\r\n\r\n")
+            await writer.drain()
         except (ConnectionResetError, BrokenPipeError):
             pass
-        return {"stream": "infinite", "bytes_sent": sent, "pattern": pattern}
+        return {"stream": "capped", "bytes_sent": sent, "cap": MAX_STREAM_BYTES,
+                "pattern": pattern}
     headers["Content-Length"] = str(total_target)
     await respond(writer, 200, headers, b"", True)
     if head_only:
@@ -397,6 +478,7 @@ curl -s "{site_url('download')}?infinite=1" | pv &gt; /dev/null</pre>""")
     try:
         while sent < total_target:
             piece = block[: min(len(block), total_target - sent)]
+            await DOWNLOAD_BUCKET.take(len(piece))
             writer.write(piece)
             await writer.drain()
             sent += len(piece)
@@ -620,6 +702,7 @@ async def handle(reader, writer):
     started = time.monotonic()
     meta = {"status": None, "extra": {}, "bytes": 0}
     host = path = method = None
+    ip_key = None
     try:
         req = await read_request(reader)
         if req is None:
@@ -638,6 +721,20 @@ async def handle(reader, writer):
             await writer.drain()
         head_only = method == "HEAD"
 
+        ip = client_ip(headers) or (peer[0] if peer else "unknown")
+        if not allow_request(ip):
+            meta["status"] = 429
+            await json_respond(writer, 429, {"error": "rate limited",
+                                            "limit": RATE_MAX, "window_s": RATE_WINDOW})
+            return
+        if IP_CONN.get(ip, 0) >= PER_IP_CONN:
+            meta["status"] = 429
+            await json_respond(writer, 429, {"error": "too many concurrent requests",
+                                            "limit": PER_IP_CONN})
+            return
+        IP_CONN[ip] = IP_CONN.get(ip, 0) + 1
+        ip_key = ip
+
         if site == "ws":
             meta["extra"] = await ws_session(reader, writer, headers, host, path)
             meta["status"] = 101
@@ -650,7 +747,15 @@ async def handle(reader, writer):
                 await respond(writer, 200, body=index_html().encode(), head_only=head_only)
             elif path == "/health":
                 meta["status"] = 200
-                await json_respond(writer, 200, vitals(), head_only)
+                token = headers.get("x-health-token", "")
+                if HEALTH_TOKEN and hmac.compare_digest(token, HEALTH_TOKEN):
+                    await json_respond(writer, 200, vitals(), head_only)
+                else:
+                    # liveness only: no paths, no disk layout, no internals
+                    await json_respond(writer, 200, {"ok": True, "ts": now_iso()}, head_only)
+            elif path == "/privacy":
+                meta["status"] = 200
+                await respond(writer, 200, body=PRIVACY_HTML.encode(), head_only=head_only)
             else:
                 meta["status"] = 404
                 await respond(writer, 404, body=b"not found\n")
@@ -735,6 +840,8 @@ curl -s -T big.iso "{site_url('upload')}?hash=md5"</pre>
                 pass
     finally:
         ACTIVE -= 1
+        if ip_key:
+            IP_CONN[ip_key] = max(0, IP_CONN.get(ip_key, 1) - 1)
         dur = round((time.monotonic() - started) * 1000, 1)
         log(event="response", host=host, path=path, method=method, status=meta["status"],
             duration_ms=dur, resp_bytes=meta["bytes"], detail=meta["extra"])

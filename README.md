@@ -39,7 +39,7 @@ curl -s --data-binary @file.bin https://testsites-upload.1110777.xyz/
 curl -s -o /dev/null -w '%{size_download}\n' \
   "https://testsites-download.1110777.xyz/?bytes=104857600"
 
-# endless
+# long chunked stream, capped at 256 MiB
 curl -s "https://testsites-download.1110777.xyz/?infinite=1" | pv > /dev/null
 ```
 
@@ -63,6 +63,30 @@ Every request is appended to `logs/access.jsonl` (one JSON object per line):
 Upload bodies are never stored; a 256-byte prefix is kept base64-encoded for
 analysis, plus full SHA-256.
 
+## Abuse limits
+
+This runs on a home uplink, so the defaults are deliberately conservative and
+all overridable by env var:
+
+| Limit | Default | Env |
+| --- | --- | --- |
+| Max bytes per stream (`bytes` or `infinite`) | 256 MiB | `MAX_STREAM_MB` |
+| Shared egress rate across all clients | 16 MiB/s | `DL_RATE_MBPS` |
+| Requests per IP per minute | 120 | `RATE_MAX` / `RATE_WINDOW` |
+| Concurrent requests per IP | 8 | `PER_IP_CONN` |
+| Concurrent connections overall | 200 | `MAX_CONN` |
+
+Over the per-IP request budget the API answers `429` with the limit that was hit.
+The shared token bucket is what actually protects the uplink: however many clients
+download at once, total outbound converges to `DL_RATE_MBPS`.
+
+## Network isolation
+
+The container runs on an `--internal` Docker network with no route off the host,
+so a compromised process cannot reach the LAN or the internet; it can only be
+reached through the published `127.0.0.1:8080` port that `cloudflared` uses. There
+are no inbound port forwards on the router: the tunnel is outbound-only.
+
 ## Monitoring
 
 `.github/workflows/monitor.yml` runs every 15 minutes (plus manual dispatch) and
@@ -78,6 +102,17 @@ from real traffic in `access.jsonl`:
 ```bash
 jq -c 'select(.headers["x-monitor"]=="gha-cron")' access.jsonl
 ```
+
+`/health` is public liveness only (`{"ok": true}`). Full vitals (RSS, connections,
+disk, log size, archive count) require `X-Health-Token` matching the `HEALTH_TOKEN`
+env var, which is also stored as the repo's `HEALTH_TOKEN` Actions secret.
+
+## Privacy
+
+[`/privacy`](https://testsites.1110777.xyz/privacy): assume everything is logged.
+Headers, cookies, IP, user agent and a short body sample may end up in the JSONL
+file. What happens to it afterwards is undecided; it may be analysed, it may be
+deleted by the rotation. Do not send secrets.
 
 ## Ops
 
@@ -101,9 +136,16 @@ docker exec testsites svc -t /service/testsites      # restart the app
 docker exec testsites svc -d /service/accesslog-rotate
 ```
 
-`testsites-tunnel.service` still runs on the host:
-`cloudflared tunnel --protocol http2 run` (QUIC registration was unreliable on this
-link, hence http2). Tunnel config: `~/.cloudflared/testsites.yml`, tunnel `9dbf4b04-…`.
+`cloudflared` runs as a second container on the same internal network, with its own
+`egress` network so it can reach Cloudflare. The app itself has **no** route off the
+host and no published port, so the only way in is the tunnel, and a compromised app
+process cannot reach the LAN or the internet. Tunnel config:
+`/opt/testsites-tunnel/config.yml` (mounted read-only), tunnel `9dbf4b04-…`.
+
+```bash
+docker logs testsites-tunnel | grep 'Registered tunnel connection'
+docker network inspect testsites-net --format '{{.Internal}}'   # true
+```
 
 ### Access log rotation
 
