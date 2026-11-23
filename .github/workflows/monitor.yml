@@ -1,0 +1,172 @@
+name: monitor
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: monitor
+  cancel-in-progress: false
+
+env:
+  BASE_DOMAIN: 1110777.xyz
+  UA: testsites-gha-monitor/1.0 (+https://github.com/theSoberSobber/testsites)
+  TAG: gha-cron
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Sites answer
+        shell: bash
+        run: |
+          set -uo pipefail
+          fail=0
+          : > /tmp/sites.txt
+          for h in testsites testsites-echo testsites-upload testsites-download testsites-ws testsites-gui testsites-ip testsites-tools; do
+            code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 \
+              -A "$UA" -H "X-Monitor: $TAG" -H "X-Monitor-Run: ${{ github.run_id }}" \
+              "https://$h.$BASE_DOMAIN/" || echo 000)
+            echo "- $h -> $code" >> /tmp/sites.txt
+            if [ "$h" = "testsites-ws" ]; then
+              [ "$code" = "400" ] || fail=1   # plain GET on the ws host is a 400 by design
+            else
+              [ "$code" = "200" ] || fail=1
+            fi
+          done
+          cat /tmp/sites.txt
+          cat /tmp/sites.txt >> "$GITHUB_STEP_SUMMARY"
+          exit $fail
+
+      - name: Upload integrity (4 MiB)
+        shell: bash
+        run: |
+          set -euo pipefail
+          head -c 4194304 /dev/urandom > /tmp/payload.bin
+          want=$(sha256sum /tmp/payload.bin | cut -d' ' -f1)
+          got=$(curl -sS --max-time 120 -A "$UA" -H "X-Monitor: $TAG" \
+                --data-binary @/tmp/payload.bin "https://testsites-upload.$BASE_DOMAIN/" \
+                | python3 -c 'import sys,json; print(json.load(sys.stdin)["sha256"])')
+          echo "local=$want remote=$got" >> "$GITHUB_STEP_SUMMARY"
+          [ "$want" = "$got" ] || { echo "::error::upload hash mismatch"; exit 1; }
+
+      - name: Download sizes
+        shell: bash
+        run: |
+          set -euo pipefail
+          n=$(curl -sS --max-time 60 -A "$UA" -H "X-Monitor: $TAG" \
+              "https://testsites-download.$BASE_DOMAIN/?bytes=1048576" | wc -c)
+          echo "- download 1048576 bytes -> got $n" | tee -a "$GITHUB_STEP_SUMMARY"
+          [ "$n" -eq 1048576 ] || { echo "::error::short read"; exit 1; }
+          head=$(curl -sS -o /dev/null -D- --max-time 30 -A "$UA" -H "X-Monitor: $TAG" \
+              "https://testsites-download.$BASE_DOMAIN/?bytes=4096&filename=demo.pdf" \
+              | tr -d '\r' | grep -i '^content-type:')
+          echo "- $head" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "$head" | grep -qi 'application/pdf' || { echo "::error::bad filename type"; exit 1; }
+
+      - name: WebSocket echo
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, os, socket, ssl
+          host = "testsites-ws.1110777.xyz"
+          s = socket.create_connection((host, 443), 15)
+          s = ssl.create_default_context().wrap_socket(s, server_hostname=host)
+          key = base64.b64encode(os.urandom(16)).decode()
+          s.send(f"GET / HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                 f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n"
+                 f"User-Agent: {os.environ['UA']}\r\nX-Monitor: {os.environ['TAG']}\r\n\r\n".encode())
+          buf = b""
+          while b"\r\n\r\n" not in buf:
+              buf += s.recv(4096)
+          status = buf.split(b"\r\n")[0].decode()
+          assert "101" in status, status
+          msg = b"monitor-ping"
+          mask = os.urandom(4)
+          s.send(bytes([0x81, 0x80 | len(msg)]) + mask +
+                 bytes(c ^ mask[i % 4] for i, c in enumerate(msg)))
+          def readn(n):
+              d = b""
+              while len(d) < n:
+                  d += s.recv(n - len(d))
+              return d
+          h = readn(2)
+          data = readn(h[1] & 0x7F)
+          s.close()
+          assert data == msg, data
+          print(f"- websocket echoed {data!r}, handshake {status}")
+          PY
+
+      - name: Echo, cookies, IP
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -sS --max-time 20 -A "$UA" -H "X-Monitor: $TAG" -b 'monitor=gha' \
+            "https://testsites-echo.$BASE_DOMAIN/" > /tmp/echo.json
+          python3 - <<'PY'
+          import json
+          d = json.load(open("/tmp/echo.json"))
+          assert d["cookies"].get("monitor") == "gha", d["cookies"]
+          assert d["headers"].get("x-monitor") == "gha-cron", d["headers"]
+          print(f"- echo saw cookie and x-monitor, ua={d['headers'].get('user-agent')}")
+          PY
+          curl -sS --max-time 20 -A "$UA" -H "X-Monitor: $TAG" \
+            "https://testsites-ip.$BASE_DOMAIN/" | python3 -c \
+            'import sys,json; d=json.load(sys.stdin); assert d["cf_connecting_ip"]; print("- edge ip:", d["cf_connecting_ip"])'
+
+      - name: Tools (status, delay, gzip)
+        shell: bash
+        run: |
+          set -euo pipefail
+          code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 -A "$UA" \
+            -H "X-Monitor: $TAG" "https://testsites-tools.$BASE_DOMAIN/status?code=418")
+          [ "$code" = "418" ] || { echo "::error::status passthrough got $code"; exit 1; }
+          t=$(curl -sS -o /dev/null -w '%{time_total}' --max-time 20 -A "$UA" \
+            -H "X-Monitor: $TAG" "https://testsites-tools.$BASE_DOMAIN/delay?ms=700")
+          awk -v t="$t" 'BEGIN{exit !(t>0.6)}' || { echo "::error::delay not applied"; exit 1; }
+          enc=$(curl -sS -o /dev/null -D- --max-time 30 -A "$UA" -H "X-Monitor: $TAG" \
+            -H 'Accept-Encoding: gzip' "https://testsites-tools.$BASE_DOMAIN/gzip?kb=256" \
+            | tr -d '\r' | grep -i '^content-encoding:')
+          echo "- 418 ok, delay ${t}s, $enc" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "$enc" | grep -qi gzip || { echo "::error::gzip missing"; exit 1; }
+
+      - name: GUI multipart upload
+        shell: bash
+        run: |
+          set -euo pipefail
+          head -c 65536 /dev/urandom > /tmp/gui.bin
+          body=$(curl -sS --max-time 60 -A "$UA" -H "X-Monitor: $TAG" \
+                 -F 'file=@/tmp/gui.bin;filename=monitor.bin' \
+                 -F 'text=from-gha' "https://testsites-gui.$BASE_DOMAIN/")
+          echo "$body" | grep -q 'Upload complete' || { echo "::error::gui form failed"; exit 1; }
+          echo "$body" | grep -q '65,536' || { echo "::error::gui byte count wrong"; exit 1; }
+          echo "- GUI multipart 65536 bytes accepted" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Container vitals and storage headroom
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -sS --max-time 20 -A "$UA" -H "X-Monitor: $TAG" \
+            "https://testsites.$BASE_DOMAIN/health" > /tmp/health.json
+          cat /tmp/health.json | tee -a "$GITHUB_STEP_SUMMARY"
+          python3 - <<'PY'
+          import json
+          h = json.load(open("/tmp/health.json"))
+          assert h["ok"] is True
+          assert h["disk"]["free_pct"] > 5, h["disk"]
+          assert (h["rss_kb"] or 0) < 400000, h["rss_kb"]
+          assert h["active_conns"] < h["max_conns"], h
+          PY
+
+      - name: Report
+        if: always()
+        shell: bash
+        run: |
+          echo "### monitorsites probe ${{ github.run_id }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "tagged in the warehouse as \`X-Monitor: $TAG\` / UA \`$UA\`" >> "$GITHUB_STEP_SUMMARY"

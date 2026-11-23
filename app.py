@@ -28,6 +28,7 @@ CHUNK = 1024 * 1024
 MAX_CONN = 200
 MAX_WS_FRAME = 4 * 1024 * 1024
 ACTIVE = 0
+STARTED_AT = time.monotonic()
 
 REASONS = {
     200: "OK", 201: "Created", 204: "No Content", 301: "Moved Permanently",
@@ -223,16 +224,43 @@ def upload_json(**kw):
                      + json.dumps(kw, indent=2, default=str) + "</pre>")
 
 
-def gui_html(host):
-    return html_page("GUI upload", f"""
+GUI_PAGE = """
 <h1>GUI upload</h1>
 <p class="muted">Streamed to memory, hashed, discarded. Nothing touches disk.</p>
-<form method="post" enctype="multipart/form-data" action="/">
-  <p><input type="file" name="file" multiple></p>
+<form id="up" method="post" enctype="multipart/form-data" action="/">
+  <p><textarea name="text" rows="4" cols="60" placeholder="optional text payload"></textarea></p>
+  <p><input id="files" type="file" name="file" multiple></p>
+  <p><label><input id="raw" type="checkbox"> send text as raw body (no multipart)</label>
+     <span class="muted" id="rawnote">files are ignored in raw mode</span></p>
   <p><button type="submit">Upload</button></p>
 </form>
+<p id="msg" class="warn"></p>
+<p class="muted">Cloudflare Free caps a single request body at 100 MB; bigger uploads fail at
+ the edge with 413/502 before reaching this server. Multiple files are multipart-only.</p>
 <h2>curl</h2>
-<pre>curl -s -F "file=@big.iso" {site_url('gui')}</pre>""")
+<pre>curl -s -F "file=@big.iso" __GUI__
+printf 'raw text' | curl -s --data-binary @- -H 'Content-Type: text/plain' __GUI__</pre>
+<script>
+const f=document.getElementById('up'), files=document.getElementById('files'),
+      raw=document.getElementById('raw'), msg=document.getElementById('msg'),
+      note=document.getElementById('rawnote'), ta=document.querySelector('textarea[name=text]');
+function sync(){ if(files.files.length>1){ raw.checked=false; } raw.disabled = files.files.length>1;
+  note.textContent = files.files.length>1 ? 'raw mode unavailable with multiple files' : 'files are ignored in raw mode'; }
+files.addEventListener('change', sync);
+f.addEventListener('submit', async (e)=>{
+  const total=[...files.files].reduce((a,b)=>a+b.size,0);
+  if(!raw.checked && total===0 && !ta.value.trim()){ e.preventDefault(); msg.textContent='pick a file or type something first'; return; }
+  if(!raw.checked && total > 95*1024*1024){ e.preventDefault();
+    msg.textContent='Total '+(total/1048576).toFixed(1)+' MiB exceeds Cloudflare Free\'s 100 MB request limit, so the edge will fail it. Use files under 95 MiB.'; return; }
+  if(raw.checked){ e.preventDefault(); msg.textContent='uploading raw…';
+    const r=await fetch('/',{method:'POST',headers:{'Content-Type':'text/plain'},body:ta.value});
+    document.open(); document.write(await r.text()); document.close(); }
+});
+</script>"""
+
+
+def gui_html(host):
+    return html_page("GUI upload", GUI_PAGE.replace("__GUI__", site_url("gui")))
 
 
 def fmt_bytes(n):
@@ -393,6 +421,44 @@ def parse_cookies(raw):
             k, v = part.split("=", 1)
             out[k.strip()[:64]] = v.strip()[:512]
     return out
+
+
+def vitals():
+    """Self-reported health, cheap enough for a 15-minute cron."""
+    import resource
+    import shutil
+    try:
+        rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    except Exception:
+        rss_kb = None
+    try:
+        du = shutil.disk_usage(LOG_DIR)
+        disk = {"total_mb": round(du.total / 1048576),
+                "free_mb": round(du.free / 1048576),
+                "free_pct": round(du.free * 100.0 / du.total, 1)}
+    except Exception:
+        disk = None
+    try:
+        log_bytes = os.path.getsize(LOG_PATH)
+    except Exception:
+        log_bytes = 0
+    try:
+        archives = sum(1 for f in os.listdir(os.path.join(LOG_DIR, "archives"))
+                       if f.endswith(".gz"))
+    except Exception:
+        archives = 0
+    return {
+        "ok": True,
+        "ts": now_iso(),
+        "pid": os.getpid(),
+        "uptime_s": round(time.monotonic() - STARTED_AT),
+        "active_conns": ACTIVE,
+        "max_conns": MAX_CONN,
+        "rss_kb": rss_kb,
+        "log_bytes": log_bytes,
+        "archives": archives,
+        "disk": disk,
+    }
 
 
 def client_ip(headers):
@@ -584,7 +650,7 @@ async def handle(reader, writer):
                 await respond(writer, 200, body=index_html().encode(), head_only=head_only)
             elif path == "/health":
                 meta["status"] = 200
-                await json_respond(writer, 200, {"ok": True, "ts": now_iso()})
+                await json_respond(writer, 200, vitals(), head_only)
             else:
                 meta["status"] = 404
                 await respond(writer, 404, body=b"not found\n")
@@ -600,8 +666,10 @@ async def handle(reader, writer):
 <h1>Streaming upload</h1>
 <p class="muted">POST/PUT/PATCH any size. Memory only, never written to disk.</p>
 <pre>curl -s --data-binary @- "{site_url('upload')}" &lt; bigfile
-head -c 5G /dev/zero | curl -s --data-binary @- "{site_url('upload')}"
+head -c 50M /dev/zero | curl -s --data-binary @- "{site_url('upload')}"
 curl -s -T big.iso "{site_url('upload')}?hash=md5"</pre>
+<p class="muted">Through Cloudflare Free the edge rejects request bodies over 100 MB
+(413/526/502) before they reach this server.</p>
 <p class="muted">Query: <code>chunk</code> bytes per digest, <code>hash</code>=md5|sha1|sha512,
 <code>format</code>=html|json.</p>""").encode())
 
@@ -687,22 +755,33 @@ async def gui_upload(reader, writer, headers, host, path):
         h.update(data)
         if len(head) < 16384:
             head += data[: 16384 - len(head)]
-    names = re.findall(rb'filename="([^"]*)"', bytes(head))
+    multipart = "multipart/form-data" in headers.get("content-type", "").lower()
+    names = re.findall(rb'filename="([^"]*)"', bytes(head)) if multipart else []
     elapsed = (time.monotonic() - started) * 1000
     files = [html.escape(n.decode("utf-8", "replace")) for n in names]
+    text_field = ""
+    if multipart:
+        hit = re.search(rb'name="text"\r\n\r\n(.*?)\r\n--', bytes(head), re.S)
+        if hit:
+            text_field = html.escape(hit.group(1).decode("utf-8", "replace"))[:2000]
+    else:
+        text_field = html.escape(bytes(head).decode("utf-8", "replace"))[:2000]
+    mode = "multipart" if multipart else "raw"
     body = f"""
 <h1>Upload complete</h1>
 <table>
 <tr><th>Bytes received</th><td>{total:,} ({fmt_bytes(total)})</td></tr>
 <tr><th>SHA-256</th><td><code>{h.hexdigest()}</code></td></tr>
-<tr><th>Files</th><td>{', '.join(files) if files else '<span class="muted">none detected</span>'}</td></tr>
+<tr><th>Mode</th><td>{mode}</td></tr>
+<tr><th>Files</th><td>{', '.join(files) if files else '<span class="muted">none</span>'}</td></tr>
+<tr><th>Text</th><td>{(('<code>' + text_field + '</code>') if text_field else '<span class="muted">none</span>')}</td></tr>
 <tr><th>Time</th><td>{elapsed:.0f} ms</td></tr>
 <tr><th>Content-Length</th><td>{headers.get('content-length', 'chunked')}</td></tr>
 </table>
 <p class="muted">Body was streamed through memory and discarded.</p>
 <p><a href="/">Upload another</a> · <a href="https://{SITE}/">Index</a></p>"""
     await respond(writer, 200, body=html_page("upload complete", body).encode())
-    return {"gui_bytes": total, "sha256": h.hexdigest(), "files": files}
+    return {"gui_bytes": total, "sha256": h.hexdigest(), "files": files, "mode": mode}
 
 
 async def tools(reader, writer, headers, method, path, qs, head_only):

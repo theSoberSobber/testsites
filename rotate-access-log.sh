@@ -1,22 +1,46 @@
 #!/bin/sh
-# Size-based rotation for the JSONL access log.
+# Size-based rotation + storage guard for the JSONL access log.
 #
-# The app opens the log with O_APPEND|O_CREAT on every single record and closes it
-# immediately, so it never holds a long-lived fd. That makes rename-based rotation
-# writer-safe: once the file is moved aside, the next record recreates access.jsonl
-# at the original path. No HUP, no copytruncate, no lost lines (worst case is one
-# record landing in the archived inode during the few microseconds around the mv).
+# The app opens the log with O_APPEND|O_CREAT for every record and closes it
+# immediately, so it never holds a long-lived fd. Rename-based rotation is
+# therefore writer-safe: after the move the next record recreates access.jsonl.
 set -u
 
 DIR="${LOG_DIR:-/var/log/testsites}"
 MAX="${MAX_BYTES:-67108864}"
 KEEP="${KEEP_ARCHIVES:-20}"
 INTERVAL="${INTERVAL:-10}"
+MIN_FREE_MB="${MIN_FREE_MB:-1024}"
+MAX_ARCHIVE_MB="${MAX_ARCHIVE_MB:-2048}"
 SRC="$DIR/access.jsonl"
 ARC="$DIR/archives"
 
 mkdir -p "$ARC"
-echo "access-log rotator: dir=$DIR max=${MAX}B keep=$KEEP interval=${INTERVAL}s"
+echo "access-log rotator: dir=$DIR max=${MAX}B keep=$KEEP interval=${INTERVAL}s" \
+     "min_free=${MIN_FREE_MB}MB max_archive=${MAX_ARCHIVE_MB}MB"
+
+free_kb() { df -Pk "$ARC" 2>/dev/null | awk 'NR==2 {print $4}'; }
+arc_kb()  { du -sk "$ARC" 2>/dev/null | awk '{print $1}'; }
+
+prune() {
+    pruned=0
+    while :; do
+        oldest=$(ls -1t "$ARC"/access-*.jsonl.gz 2>/dev/null | tail -1)
+        [ -z "$oldest" ] && break
+        f=$(free_kb); a=$(arc_kb)
+        if [ "${f:-0}" -lt $((MIN_FREE_MB * 1024)) ] || [ "${a:-0}" -gt $((MAX_ARCHIVE_MB * 1024)) ]; then
+            rm -f "$oldest" && pruned=$((pruned + 1)) || break
+            echo "pruned $oldest (free=${f}KB archives=${a}KB)"
+        else
+            break
+        fi
+    done
+    # count-based retention, independent of size
+    for old in $(ls -1t "$ARC"/access-*.jsonl.gz 2>/dev/null | tail -n +$((KEEP + 1))); do
+        rm -f "$old" && pruned=$((pruned + 1)) && echo "pruned $old (keep=$KEEP)"
+    done
+    return 0
+}
 
 while :; do
     if [ -f "$SRC" ]; then
@@ -25,19 +49,16 @@ while :; do
             ts=$(date -u +%Y%m%dT%H%M%SZ)
             target="$ARC/access-$ts.jsonl"
             if mv "$SRC" "$target" 2>/dev/null; then
-                # recreate immediately so a writer never finds the path missing;
-                # touch never truncates, so a record written in the gap survives
+                # recreate at once; touch never truncates, so a record written
+                # in the gap between mv and touch is not lost
                 touch "$SRC" 2>/dev/null || true
                 echo "rotated ${size}B -> $target"
-                # compress off the hot path; the writer is already on a fresh file
-                gzip -9 "$target" && echo "compressed $target.gz"
-                pruned=0
-                for old in $(ls -1t "$ARC"/access-*.jsonl.gz 2>/dev/null | tail -n +$((KEEP + 1))); do
-                    rm -f "$old" && pruned=$((pruned + 1))
-                done
-                [ "$pruned" -gt 0 ] && echo "pruned $pruned old archive(s)"
+                if gzip -9 "$target"; then
+                    echo "compressed $target.gz"
+                fi
             fi
         fi
     fi
+    prune
     sleep "$INTERVAL"
 done

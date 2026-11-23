@@ -19,7 +19,7 @@ server. Nothing is written to disk; uploads are streamed through memory and hash
 | --- | --- |
 | https://testsites.1110777.xyz/ | Inventory / table of contents |
 | https://testsites-upload.1110777.xyz/ | Streaming upload, memory only |
-| https://testsites-gui.1110777.xyz/ | Browser form upload (multipart) |
+| https://testsites-gui.1110777.xyz/ | Browser form: text box, files, or raw-body mode |
 | https://testsites-download.1110777.xyz/ | Content-Length sink or infinite stream |
 | https://testsites-ws.1110777.xyz/ | WebSocket echo (text + binary) |
 | https://testsites-headers.1110777.xyz/ | JSON dump of all request headers |
@@ -29,8 +29,8 @@ server. Nothing is written to disk; uploads are streamed through memory and hash
 ## Examples
 
 ```bash
-# 5 GiB upload, nothing on disk
-head -c 5G /dev/zero | curl -s --data-binary @- https://testsites-upload.1110777.xyz/
+# upload, nothing on disk (Cloudflare Free rejects >100 MB per request)
+head -c 50M /dev/zero | curl -s --data-binary @- https://testsites-upload.1110777.xyz/
 
 # verify the hash round-trips
 curl -s --data-binary @file.bin https://testsites-upload.1110777.xyz/
@@ -62,6 +62,22 @@ Every request is appended to `logs/access.jsonl` (one JSON object per line):
 
 Upload bodies are never stored; a 256-byte prefix is kept base64-encoded for
 analysis, plus full SHA-256.
+
+## Monitoring
+
+`.github/workflows/monitor.yml` runs every 15 minutes (plus manual dispatch) and
+exercises the sites end to end: status codes, a 4 MiB upload checked against
+SHA-256, exact `?bytes=` download length, `?filename=` content type, a real
+WebSocket echo, cookie/header echo, 418 pass-through, delay, gzip, a GUI
+multipart POST, and `/health` vitals (RSS, connections, disk headroom).
+
+Every probe carries `X-Monitor: gha-cron`, a unique `X-Monitor-Run` id and the
+`testsites-gha-monitor` user agent, so monitor traffic is trivially separable
+from real traffic in `access.jsonl`:
+
+```bash
+jq -c 'select(.headers["x-monitor"]=="gha-cron")' access.jsonl
+```
 
 ## Ops
 
@@ -95,6 +111,11 @@ link, hence http2). Tunnel config: `~/.cloudflared/testsites.yml`, tunnel `9dbf4
 passes `MAX_BYTES` (default 64 MiB), renames it to
 `archives/access-<UTC>.jsonl`, recreates the live path, gzips the archive and keeps
 the newest `KEEP_ARCHIVES` (default 20) gzipped files.
+
+Beyond time-based rotation it also enforces storage limits every poll:
+`MIN_FREE_MB` (default 1024) prunes the oldest archive whenever the volume drops
+below that free-space floor, and `MAX_ARCHIVE_MB` (default 2048) caps the archive
+directory. That is what keeps a burst of traffic from filling the laptop's disk.
 
 It is safe against the writer because the app opens the log with
 `O_APPEND|O_CREAT` for every record and closes it immediately — there is no
