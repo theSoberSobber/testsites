@@ -1,0 +1,6 @@
+#!/bin/sh
+exec 2>&1
+export LOG_DIR="${LOG_DIR:-/var/log/testsites}"
+export PORT="${PORT:-8080}"
+echo "testsites: starting on :$PORT, access log $LOG_DIR/access.jsonl"
+exec python3 -u /app/app.py

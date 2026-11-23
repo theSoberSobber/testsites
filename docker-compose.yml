@@ -1,0 +1,15 @@
+services:
+  testsites:
+    build: .
+    image: testsites:latest
+    container_name: testsites
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - /var/log/testsites:/var/log/testsites
+    environment:
+      LOG_DIR: /var/log/testsites
+      MAX_BYTES: "67108864"   # rotate access.jsonl at 64 MiB
+      KEEP_ARCHIVES: "20"     # then keep 20 gzipped archives
+      INTERVAL: "10"          # check every 10s

@@ -1,0 +1,4 @@
+#!/bin/sh
+exec 2>&1
+echo "accesslog-rotate: max=${MAX_BYTES:-67108864}B keep=${KEEP_ARCHIVES:-20} interval=${INTERVAL:-10}s"
+exec /usr/local/bin/rotate-access-log.sh

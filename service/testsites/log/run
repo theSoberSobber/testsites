@@ -1,0 +1,5 @@
+#!/bin/sh
+exec 2>&1
+mkdir -p /var/log/testsites/svc/testsites
+# t = timestamp, s1000000 = rotate at 1 MB, n10 = keep 10 files
+exec multilog t s1000000 n10 /var/log/testsites/svc/testsites
