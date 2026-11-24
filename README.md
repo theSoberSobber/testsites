@@ -82,10 +82,25 @@ download at once, total outbound converges to `DL_RATE_MBPS`.
 
 ## Network isolation
 
-The container runs on an `--internal` Docker network with no route off the host,
-so a compromised process cannot reach the LAN or the internet; it can only be
-reached through the published `127.0.0.1:8080` port that `cloudflared` uses. There
-are no inbound port forwards on the router: the tunnel is outbound-only.
+Everything runs under Docker Compose (`docker-compose.yml` for the app and tunnel,
+`monitoring/docker-compose.yml` for the metrics stack).
+
+The app container sits on `testsites-net`, an `internal` network with no route off
+the host, and publishes no ports at all: the only way in is `cloudflared` over that
+same network. There are no inbound port forwards on the router; the tunnel is
+outbound-only. `cloudflared` gets a second network (`testsites_egress`) for its
+outbound connection to Cloudflare.
+
+A small `testsites-netguard` systemd unit (`/usr/local/sbin/testsites-netguard.sh`)
+adds `DOCKER-USER` and `INPUT` rules so the tunnel and monitoring subnets cannot
+reach the home LAN (`192.168.0.0/16`, `10.0.0.0/8`), the host's SSH port, the
+Tailscale address, the monitoring subnet (for the tunnel), or each other. The
+rules match `--ctstate NEW`, so replies to published ports still work.
+
+```bash
+sudo systemctl status testsites-netguard
+sudo iptables -S DOCKER-USER | grep REJECT
+```
 
 ## Monitoring
 
@@ -107,6 +122,21 @@ jq -c 'select(.headers["x-monitor"]=="gha-cron")' access.jsonl
 disk, log size, archive count) require `X-Health-Token` matching the `HEALTH_TOKEN`
 env var, which is also stored as the repo's `HEALTH_TOKEN` Actions secret.
 
+### Dashboards
+
+The `monitoring/` stack runs Prometheus, Loki, Promtail, node_exporter and a small
+stdlib exporter that tails `access.jsonl`. Grafana listens only on the Tailscale
+address, never the LAN:
+
+```
+http://100.112.185.9:3000/d/testsites
+```
+
+The admin password lives in `monitoring/.env` (`GRAFANA_PASSWORD`, mode 600,
+gitignored). The dashboard covers requests/responses by host and status, upload
+and download bytes, request duration, unique IPs, log growth and disk headroom,
+host CPU/memory/load, and Loki panels for access and container logs.
+
 ## Privacy
 
 [`/privacy`](https://testsites.1110777.xyz/privacy): assume everything is logged.
@@ -117,8 +147,12 @@ deleted by the rotation. Do not send secrets.
 ## Ops
 
 ```bash
-sudo systemctl status testsites testsites-tunnel
-sudo journalctl -u testsites-tunnel -n 50
+cd /home/pavit/testsites
+sudo docker compose ps
+sudo docker compose logs --tail 50 tunnel
+sudo docker compose up -d --build     # deploy a new app.py
+
+cd monitoring && sudo docker compose ps && cd ..
 ```
 
 The app runs in Docker under **daemontools** (`svscan`), so each piece is supervised:
