@@ -708,7 +708,7 @@ async def handle(reader, writer):
         return
     peer = writer.get_extra_info("peername")
     started = time.monotonic()
-    meta = {"status": None, "extra": {}, "bytes": 0}
+    meta = {"status": None, "extra": {}, "bytes": 0, "probe": None}
     host = path = method = None
     ip_key = None
     try:
@@ -720,8 +720,10 @@ async def handle(reader, writer):
         path, qs = parts.path, parse_qs(parts.query)
         host = headers.get("host", "")
         site = route(host)
+        # X-Monitor marks synthetic probe traffic (GitHub Actions, manual checks).
+        meta["probe"] = (headers.get("x-monitor") or "").strip()[:32].lower() or None
         log(event="request", host=host, site=site, method=method, path=path,
-            query=parts.query, http_version=version, headers=headers,
+            query=parts.query, http_version=version, headers=headers, probe=meta["probe"],
             client_ip=client_ip(headers), peer=peer, cf_ray=headers.get("cf-ray"),
             user_agent=headers.get("user-agent"), referer=headers.get("referer"))
         if headers.get("expect", "").lower() == "100-continue":
@@ -863,7 +865,8 @@ curl -s -T big.iso "{site_url('upload')}?hash=md5"</pre>
             IP_CONN[ip_key] = max(0, IP_CONN.get(ip_key, 1) - 1)
         dur = round((time.monotonic() - started) * 1000, 1)
         log(event="response", host=host, path=path, method=method, status=meta["status"],
-            duration_ms=dur, resp_bytes=meta["bytes"], detail=meta["extra"])
+            duration_ms=dur, resp_bytes=meta["bytes"], detail=meta["extra"],
+            probe=meta["probe"])
         try:
             writer.close()
             await writer.wait_closed()

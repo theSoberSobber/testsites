@@ -1,0 +1,11 @@
+apiVersion: 1
+contactPoints:
+  - orgId: 1
+    name: ntfy
+    receivers:
+      - uid: ntfy-push
+        type: webhook
+        disableResolveMessage: false
+        settings:
+          url: https://ntfy.sh/${NTFY_TOPIC}?title=testsites&priority=high&tags=rotating_light
+          httpMethod: POST

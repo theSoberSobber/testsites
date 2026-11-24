@@ -1,0 +1,123 @@
+apiVersion: 1
+groups:
+  - orgId: 1
+    name: external-probes
+    folder: Testsites
+    interval: 1m
+    rules:
+      - uid: testsites-probe-stale
+        title: GHA probes stopped arriving
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: prom
+            model:
+              editorMode: code
+              expr: time() - max(testsites_probe_last_seen_timestamp_seconds{probe="gha-cron"})
+              instant: true
+              range: false
+              refId: A
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              refId: B
+              type: reduce
+              reducer: last
+              settings: {mode: ""}
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator: {params: [1800], type: gt}
+              datasource: {type: __expr__, uid: __expr__}
+              expression: B
+              refId: C
+              type: threshold
+        noDataState: Alerting
+        execErrState: Alerting
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: No GitHub Actions probe has reached the suite in 30 minutes.
+          description: The tunnel, the app or the runner is down. GitHub also shows this as a red run.
+
+      - uid: testsites-probe-failing
+        title: GHA probes are failing
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: {from: 900, to: 0}
+            datasourceUid: prom
+            model:
+              editorMode: code
+              expr: sum(increase(testsites_probe_responses_total{probe="gha-cron",status!~"2.."}[15m]))
+              instant: true
+              range: false
+              refId: A
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              refId: B
+              type: reduce
+              reducer: last
+              settings: {mode: ""}
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator: {params: [0], type: gt}
+              datasource: {type: __expr__, uid: __expr__}
+              expression: B
+              refId: C
+              type: threshold
+        noDataState: OK
+        execErrState: Alerting
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: Probes reached the app but got a non-2xx answer.
+          description: Something works (the tunnel is up) but the endpoint itself is unhealthy.
+
+      - uid: testsites-disk-low
+        title: Disk headroom below 10 percent
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: prom
+            model:
+              editorMode: code
+              expr: min(testsites_disk_free_pct)
+              instant: true
+              range: false
+              refId: A
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              datasource: {type: __expr__, uid: __expr__}
+              expression: A
+              refId: B
+              type: reduce
+              reducer: last
+              settings: {mode: ""}
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator: {params: [10], type: lt}
+              datasource: {type: __expr__, uid: __expr__}
+              expression: B
+              refId: C
+              type: threshold
+        noDataState: OK
+        execErrState: Alerting
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: Under 10% free on the testsites volume.
+          description: Log rotation is trimming archives; check for a runaway burst.

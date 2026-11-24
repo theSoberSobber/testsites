@@ -137,6 +137,41 @@ gitignored). The dashboard covers requests/responses by host and status, upload
 and download bytes, request duration, unique IPs, log growth and disk headroom,
 host CPU/memory/load, and Loki panels for access and container logs.
 
+### External probes
+
+Probe traffic is tagged at the source: the app records `probe` on every log
+record that carries `X-Monitor` (GHA sends `gha-cron`). The exporter turns that
+into `testsites_probe_requests_total`, `testsites_probe_responses_total`,
+`testsites_probe_duration_seconds`, `testsites_probe_upload_bytes_total`,
+`testsites_probe_last_seen_timestamp_seconds` and `testsites_probe_gap_seconds`.
+
+The dashboard's "External probes" row shows probe age, success rate, count,
+upload volume, latency and status mix. Last probe age is the important one: GHA
+runs every 15 minutes, so anything past ~35 minutes means the tunnel, the runner
+or the app is down. Grafana evaluates that from `time() - max(last_seen)`, which
+still works when no probe can reach the box.
+
+### Alerts
+
+Provisioned in `monitoring/grafana/provisioning/alerting/`:
+
+| rule | fires when |
+| --- | --- |
+| GHA probes stopped arriving | no probe in 30 min (critical) |
+| GHA probes are failing | probes arrive but get non-2xx (warning) |
+| Disk headroom below 10 percent | free space on the volume (warning) |
+| Delivery self-test (paused) | manually unpaused, proves the phone buzzes |
+
+Delivery is a webhook to [ntfy](https://ntfy.sh): subscribe to the topic in
+`monitoring/.env` (`NTFY_TOPIC`, gitignored) in the ntfy app or at
+`https://ntfy.sh/<topic>`. Treat it as a secret — anyone who knows the topic can
+read it. Change the value and restart Grafana to rotate it.
+
+This is deliberately two-layered. Grafana can notice *stale* probes, but it
+cannot notice the whole box being down. That case is covered by the GHA workflow
+itself going red (GitHub emails the workflow owner) — set that notification in
+GitHub if you want it.
+
 ## Privacy
 
 [`/privacy`](https://testsites.1110777.xyz/privacy): assume everything is logged.

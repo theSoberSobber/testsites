@@ -8,6 +8,7 @@ import json
 import os
 import threading
 import time
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 LOG_DIR = os.environ.get("LOG_DIR", "/var/log/testsites")
@@ -25,6 +26,8 @@ hist = {b: 0 for b in BUCKETS}
 hist_inf = 0
 hist_sum = 0.0
 hist_count = 0
+probe_last = {}        # probe name -> newest event timestamp (from the log line)
+probe_hist = {}        # probe name -> [bucket counts, +Inf, sum, count]
 parse_errors = 0
 started = time.time()
 
@@ -44,12 +47,22 @@ def add(name, labels, value=1):
     counters[key] = counters.get(key, 0) + value
 
 
+def event_time(d, fallback):
+    try:
+        return datetime.fromisoformat(str(d.get("ts")).replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return fallback
+
+
 def ingest(d, now):
     global last_request, hist_inf, hist_sum, hist_count
     site = site_of(d)
     ev = d.get("event")
+    probe = d.get("probe") or None
     if ev == "request":
         add("testsites_requests_total", {"site": site, "method": d.get("method") or ""})
+        if probe:
+            add("testsites_probe_requests_total", {"probe": probe, "site": site})
         ip = d.get("client_ip")
         if ip:
             ip_seen[ip] = now
@@ -67,11 +80,25 @@ def ingest(d, now):
             hist[b] += 1
     if dur > BUCKETS[-1]:
         hist_inf += 1
+    if probe:
+        add("testsites_probe_responses_total",
+            {"probe": probe, "site": site, "status": str(d.get("status"))})
+        h = probe_hist.setdefault(probe, [dict.fromkeys(BUCKETS, 0), 0, 0.0, 0])
+        for b in BUCKETS:
+            if dur <= b:
+                h[0][b] += 1
+        if dur > BUCKETS[-1]:
+            h[1] += 1
+        h[2] += dur
+        h[3] += 1
+        probe_last[probe] = max(probe_last.get(probe, 0.0), event_time(d, now))
     detail = d.get("detail") or {}
     upload = sum(float(v) for k, v in detail.items()
                  if isinstance(v, (int, float)) and "bytes" in k and v)
     if upload:
         add("testsites_upload_bytes_total", {"site": site}, upload)
+        if probe:
+            add("testsites_probe_upload_bytes_total", {"probe": probe}, upload)
     if site == "ws" and d.get("status") == 101:
         add("testsites_ws_connections_total", {})
 
@@ -144,6 +171,22 @@ def render():
         lines.append(f'testsites_request_duration_seconds_bucket{{le="+Inf"}} {hist[b] + hist_inf}')
         lines.append(f"testsites_request_duration_seconds_sum {hist_sum:.6f}")
         lines.append(f"testsites_request_duration_seconds_count {hist_count}")
+
+        # external probe health (GitHub Actions and friends)
+        if probe_hist:
+            lines.append("# HELP testsites_probe_duration_seconds Probe response time")
+            lines.append("# TYPE testsites_probe_duration_seconds histogram")
+            for probe, (buckets, inf, psum, pcount) in sorted(probe_hist.items()):
+                for b in BUCKETS:
+                    lines.append(f'testsites_probe_duration_seconds_bucket{{probe="{esc(probe)}",le="{b}"}} {buckets[b]}')
+                lines.append(f'testsites_probe_duration_seconds_bucket{{probe="{esc(probe)}",le="+Inf"}} {buckets[BUCKETS[-1]] + inf}')
+                lines.append(f'testsites_probe_duration_seconds_sum{{probe="{esc(probe)}"}} {psum:.6f}')
+                lines.append(f'testsites_probe_duration_seconds_count{{probe="{esc(probe)}"}} {pcount}')
+        for probe, ts in sorted(probe_last.items()):
+            series("testsites_probe_last_seen_timestamp_seconds", {"probe": probe}, f"{ts:.3f}",
+                   "gauge", "Unix time of the newest probe request seen in the log")
+            series("testsites_probe_gap_seconds", {"probe": probe}, f"{max(0.0, now - ts):.0f}",
+                   "gauge", "Seconds since the newest probe request")
 
         series("testsites_unique_ips_5m", {}, len(ip_seen), "gauge",
                "Distinct client IPs seen in the last 5 minutes")

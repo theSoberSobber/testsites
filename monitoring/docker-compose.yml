@@ -108,6 +108,7 @@ services:
       GF_NEWS_NEWS_FEED_ENABLED: "false"
       GF_SERVER_ROOT_URL: "http://100.112.185.9:3000/"
       GF_SECURITY_DISABLE_GRAVATAR: "true"
+      NTFY_TOPIC: ${NTFY_TOPIC:-testsites-unset-topic}
     # Tailscale interface only: not on the LAN, not through the tunnel
     ports:
       - "100.112.185.9:3000:3000"

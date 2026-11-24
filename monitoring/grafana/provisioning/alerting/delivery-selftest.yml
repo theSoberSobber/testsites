@@ -1,0 +1,34 @@
+# A deliberately paused always-firing rule: unpause it in the Grafana UI (or
+# remove isPaused and restart) to prove that alerts reach your phone.
+apiVersion: 1
+groups:
+  - orgId: 1
+    name: selftest
+    folder: Testsites
+    interval: 30s
+    rules:
+      - uid: testsites-selftest
+        title: Delivery self-test (paused)
+        condition: C
+        isPaused: true
+        data:
+          - refId: A
+            relativeTimeRange: {from: 60, to: 0}
+            datasourceUid: prom
+            model: {editorMode: code, expr: "vector(1)", instant: true, range: false, refId: A}
+          - refId: B
+            datasourceUid: __expr__
+            model: {datasource: {type: __expr__, uid: __expr__}, expression: A, refId: B, type: reduce, reducer: last, settings: {mode: ""}}
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              conditions: [{evaluator: {params: [0], type: gt}}]
+              datasource: {type: __expr__, uid: __expr__}
+              expression: B
+              refId: C
+              type: threshold
+        noDataState: OK
+        execErrState: OK
+        for: 0s
+        labels: {severity: info}
+        annotations: {summary: "Self-test: alert delivery reaches your phone."}
