@@ -190,6 +190,14 @@ async def respond(writer, status, headers=None, body=b"", head_only=False):
         "%a, %d %b %Y %H:%M:%S GMT"))
     headers.setdefault("Connection", "close")
     headers.setdefault("X-Content-Type-Options", "nosniff")
+    headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+    headers.setdefault("X-Frame-Options", "DENY")
+    headers.setdefault("Referrer-Policy", "no-referrer")
+    headers.setdefault("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
+    headers.setdefault("Content-Security-Policy",
+        "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; "
+        "img-src 'self' data:; connect-src 'self' ws: wss:; form-action 'self'; "
+        "base-uri 'none'; frame-ancestors 'none'")
     if body and "Content-Type" not in headers:
         headers["Content-Type"] = "text/html; charset=utf-8"
     if body and "Content-Length" not in headers:
