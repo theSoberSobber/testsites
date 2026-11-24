@@ -1,0 +1,130 @@
+services:
+  exporter:
+    image: python:3.12-slim
+    container_name: testsites-exporter
+    restart: unless-stopped
+    command: ["python", "-u", "/app/exporter.py"]
+    volumes:
+      - ./exporter.py:/app/exporter.py:ro
+      - /var/log/testsites:/var/log/testsites:ro
+    environment:
+      LOG_DIR: /var/log/testsites
+      PORT: "9101"
+    user: "1001:1001"
+    read_only: true
+    tmpfs: ["/tmp"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 128m
+    pids_limit: 64
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:9101/healthz',timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    networks: [mon]
+
+  node:
+    image: prom/node-exporter:latest
+    container_name: testsites-node
+    restart: unless-stopped
+    command:
+      - --path.rootfs=/host
+      - --collector.disable-defaults
+      - --collector.cpu
+      - --collector.meminfo
+      - --collector.loadavg
+      - --collector.filesystem
+      - --collector.diskstats
+    volumes:
+      - /:/host:ro,rslave
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 128m
+    pid: host
+    networks: [mon]
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: testsites-prometheus
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=90d
+      - --storage.tsdb.retention.size=2GB
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prom-data:/prometheus
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 512m
+    networks: [mon]
+
+  loki:
+    image: grafana/loki:latest
+    container_name: testsites-loki
+    restart: unless-stopped
+    command: ["-config.file=/etc/loki/loki.yml"]
+    volumes:
+      - ./loki.yml:/etc/loki/loki.yml:ro
+      - loki-data:/loki
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 512m
+    networks: [mon]
+
+  promtail:
+    image: grafana/promtail:latest
+    container_name: testsites-promtail
+    restart: unless-stopped
+    command: ["-config.file=/etc/promtail/promtail.yml"]
+    volumes:
+      - ./promtail.yml:/etc/promtail/promtail.yml:ro
+      - /var/log/testsites:/var/log/testsites:ro
+      - /var/lib/testsites-promtail:/positions
+    user: "1001:1001"
+    read_only: true
+    tmpfs: ["/tmp"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 256m
+    depends_on: [loki]
+    networks: [mon]
+
+  grafana:
+    image: grafana/grafana-oss:latest
+    container_name: testsites-grafana
+    restart: unless-stopped
+    depends_on: [prometheus, loki]
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:?set GRAFANA_PASSWORD in monitoring/.env}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+      GF_SERVER_ROOT_URL: "http://100.112.185.9:3000/"
+      GF_SECURITY_DISABLE_GRAVATAR: "true"
+    # Tailscale interface only: not on the LAN, not through the tunnel
+    ports:
+      - "100.112.185.9:3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 512m
+    networks: [mon]
+
+networks:
+  mon:
+    name: testsites-monitoring
+
+volumes:
+  prom-data:
+  loki-data:
+  grafana-data:

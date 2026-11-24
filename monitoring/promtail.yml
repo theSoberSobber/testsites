@@ -1,0 +1,45 @@
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+  log_level: warn
+
+positions:
+  filename: /positions/positions.yaml
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+    batchwait: 2s
+
+scrape_configs:
+  - job_name: access
+    static_configs:
+      - targets: [localhost]
+        labels:
+          job: access
+          __path__: /var/log/testsites/access.jsonl
+    pipeline_stages:
+      - json:
+          expressions:
+            event: event
+            site: site
+            host: host
+            method: method
+            status: status
+      - labels:
+          event:
+          site:
+          method:
+          status:
+
+  - job_name: services
+    static_configs:
+      - targets: [localhost]
+        labels:
+          job: service
+          __path__: /var/log/testsites/svc/*/current
+    pipeline_stages:
+      - regex:
+          expression: '^/var/log/testsites/svc/(?P<service>[^/]+)/'
+          source: filename
+      - labels:
+          service:
