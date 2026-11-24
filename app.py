@@ -234,7 +234,14 @@ code,pre{{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:
 pre{{padding:12px;overflow:auto}} .mono{{font-size:13px}}
 input[type=file]{{color:#c9d1d9}} button{{background:#238636;border:0;color:#fff;padding:9px 16px;border-radius:6px;font:inherit;cursor:pointer}}
 .muted{{color:#8b949e;font-size:13px}} .ok{{color:#3fb950}} .warn{{color:#d29922}} .err{{color:#f85149}}
-</style>{extra_head}</head><body>{body}</body></html>"""
+</style>{extra_head}</head><body>{body}
+<footer><hr style="border:0;border-top:1px solid #21262d;margin:28px 0 12px">
+<p class="muted"><a href="https://{SITE}/">home</a> ·
+<a href="https://{SITE}/llms.txt">llms.txt</a> ·
+<a href="https://{SITE}/hook">webhooks</a> ·
+<a href="https://{SITE}/privacy">privacy</a> ·
+<a href="https://github.com/theSoberSobber/testsites">source</a></p></footer>
+</body></html>"""
 
 
 PRIVACY_HTML = html_page("privacy policy", """
@@ -253,6 +260,111 @@ running on somebody's home internet, not a bank.</p>
 <p>No analytics, no ads, no third-party trackers. The only cookies here are the
 ones you bring and the ones this server echoes back to show that it can.</p>
 <p><a href="/">back to the index</a></p>""")
+
+
+LLMS_TXT = f"""# testsites
+
+> A public HTTP testing suite for humans and LLM agents. Upload, download,
+> WebSocket echo, header/cookie/IP echo, status and delay tools, and a webhook
+> inspector. Everything streams through memory; nothing is written to disk.
+> Every request is logged as JSONL. Assume everything is logged.
+
+Base index: https://{SITE}/
+Each action has its own flat host: https://testsites-<action>.{BASE_DOMAIN}/
+Machine-readable: https://{SITE}/llms.txt
+Privacy: https://{SITE}/privacy
+
+## Upload (streaming, no disk)
+
+POST, PUT or PATCH https://testsites-upload.{BASE_DOMAIN}/
+
+- Body: raw bytes, up to {MAX_STREAM_BYTES // (1024*1024)} MiB (Cloudflare Free rejects
+  request bodies over 100 MB at the edge before they arrive).
+- Query: format=json|html, hash=md5|sha1|sha256|sha512, chunk=<bytes per digest>.
+- Response: bytes received, digest, duration. Never touches disk.
+
+  curl -s -T file.bin "https://testsites-upload.{BASE_DOMAIN}/?format=json"
+  head -c 50M /dev/zero | curl -s --data-binary @- https://testsites-upload.{BASE_DOMAIN}/
+
+## Download (generated, no disk)
+
+GET https://testsites-download.{BASE_DOMAIN}/
+
+- ?bytes=N — exactly N bytes with Content-Length (max {MAX_STREAM_BYTES // (1024*1024)} MiB)
+- ?infinite=1 — chunked forever, cut at the cap
+- ?chunk=N (1024..4 MiB), ?pattern=seq|zero|random, ?rate=<bytes per second>
+- ?filename=name.ext sets Content-Disposition
+
+  curl -s -o /dev/null -w '%{{size_download}}\\n' "https://testsites-download.{BASE_DOMAIN}/?bytes=104857600"
+
+## WebSocket echo
+
+wss://testsites-ws.{BASE_DOMAIN}/
+
+- Text and binary frames are echoed back unchanged; ping is answered with pong.
+- Max frame 4 MiB; close code 1009 if exceeded.
+- A GET without Upgrade returns a small HTML explainer.
+
+## Echo, IP, headers
+
+GET https://testsites-echo.{BASE_DOMAIN}/ — JSON: method, path, query, headers,
+  cookies, body preview.
+GET https://testsites-ip.{BASE_DOMAIN}/ — the client IP as Cloudflare sees it,
+  socket peer, address families, cf-ray, country.
+
+## Tools (proxy behaviour)
+
+Base: https://testsites-tools.{BASE_DOMAIN}/
+
+- /delay?ms=N — sleep then 200 (max 300000)
+- /status?code=N — reply with any 100..599
+- /gzip?kb=N — gzip body (cap 4096 KiB)
+- /redirect?n=N — N chained 302 hops
+- /cookie?set=1 — set cookies and echo the ones received
+- /sse?n=N — N server-sent events, one per second
+- /slow?seconds=N&kbps=N — slow trickle, for timeout tests
+- /echo — mirrors method, headers and body (64 KiB cap)
+
+## Webhook inspector
+
+POST, PUT or PATCH https://{SITE}/hook
+
+- Accepts any content type and body (first 64 KiB kept, memory only, 1 hour TTL,
+  last 50 captures).
+- Returns JSON: id, url, bytes, truncated, expires_in.
+- GET /hook lists captures; GET /hook/<id> renders one; ?raw=1 returns the body;
+  DELETE /hook/<id> removes it.
+- ?status=N makes the capture reply with status N instead of 202.
+
+  curl -s -X POST https://{SITE}/hook -H 'Content-Type: application/json' \\
+    -d '{{"hello":"world"}}'
+
+## Health
+
+GET https://{SITE}/health — {{"ok":true}} only. Full vitals need the X-Health-Token
+header, which is not public.
+
+## Limits and etiquette
+
+- {MAX_STREAM_BYTES // (1024*1024)} MiB per upload or download, 100 MB through the edge.
+- {RATE_MAX} requests/minute and {PER_IP_CONN} concurrent connections per IP.
+- Shared egress cap {DL_RATE_MBPS:g} MiB/s; be considerate, this runs on a home uplink.
+- Tag synthetic traffic with `X-Monitor: <your-agent-name>` so it can be told apart
+  from real traffic in the logs.
+- No authentication, no secrets, no user data expected. Do not send credentials.
+
+## Privacy
+
+Every request may be logged: URL, headers, cookies, IP, user agent, body sample
+and hash. Logs are kept for analysis and rotated. Details: https://{SITE}/privacy
+
+## Stable facts
+
+- HTTP/1.1 origin, HTTP/2 and HTTP/3 at the Cloudflare edge, TLS 1.2+.
+- All content is generated on the fly; no files are served from disk.
+- Responses carry HSTS, CSP, X-Frame-Options DENY, Referrer-Policy no-referrer.
+- Unsupported methods get 405; unknown hosts get 403; unknown paths get 404.
+"""
 
 
 # -------------------------------------------------------------------- sites ---
@@ -290,6 +402,10 @@ curl -s "{site_url('download')}?infinite=1" | pv &gt; /dev/null
 
 # exactly 100 MiB
 curl -s -o /dev/null -w '%{{size_download}}\\n' "{site_url('download')}?bytes=104857600"</pre>
+<p class="muted">New: <a href="/hook">webhook inspector</a> — POST anything,
+get a link that renders it. Memory only, gone in an hour.</p>
+<p class="muted">Pointing an LLM or coding agent at this? Send it to
+<a href="/llms.txt">llms.txt</a> — every endpoint, limit and example in one file.</p>
 <p class="muted">Every request is logged as JSONL. <a href="/privacy">Privacy policy</a>:
 assume everything is logged.</p>""")
 
@@ -680,6 +796,131 @@ def ws_frame(opcode, payload=b""):
     return head + bytes([127]) + struct.pack("!Q", n) + payload
 
 
+# --------------------------------------------------------------- webhooks ---
+# A tiny, memory-only request bin: POST anything, get a link that renders it.
+HOOKS = {}            # id -> record
+HOOK_ORDER = []       # ids, oldest first
+HOOK_MAX = 50
+HOOK_TTL = 3600
+HOOK_BODY_MAX = 64 * 1024
+
+
+def hook_prune():
+    cutoff = time.time() - HOOK_TTL
+    while HOOK_ORDER and (HOOK_ORDER[0] not in HOOKS
+                          or HOOKS[HOOK_ORDER[0]]["at"] < cutoff
+                          or len(HOOKS) > HOOK_MAX):
+        HOOKS.pop(HOOK_ORDER.pop(0), None)
+
+
+def hook_body_text(rec):
+    blob = rec["body"]
+    if not blob:
+        return "(empty body)"
+    if "json" in (rec["ctype"] or ""):
+        try:
+            return json.dumps(json.loads(blob.decode()), indent=2)
+        except Exception:
+            pass
+    try:
+        text = blob.decode("utf-8")
+    except UnicodeDecodeError:
+        text = blob.decode("latin-1", "replace") + "\n\n(hex)\n" + blob.hex()
+    return text
+
+
+def hook_item_page(rec):
+    rows = "".join(
+        f"<tr><th>{html.escape(k)}</th><td class='mono'>{html.escape(v)}</td></tr>"
+        for k, v in sorted(rec["headers"].items())
+    )
+    when = datetime.datetime.fromtimestamp(rec["at"], datetime.timezone.utc).strftime(
+        "%Y-%m-%d %H:%M:%S UTC")
+    truncated = (f"<p class='warn'>Body was {rec['total']} bytes; only the first "
+                 f"{HOOK_BODY_MAX} were kept.</p>" if rec["truncated"] else "")
+    return html_page(f"hook {rec['id']}", f"""
+<h1>captured request <code>{rec['id']}</code></h1>
+<p class="muted">{when} · expires in an hour · <a href="/hook">all captures</a>
+ · <a href="/hook/{rec['id']}?raw=1">raw body</a></p>
+{truncated}
+<table>
+<tr><th>method</th><td class="mono">{html.escape(rec['method'])}</td></tr>
+<tr><th>path</th><td class="mono">{html.escape(rec['path'])}</td></tr>
+<tr><th>query</th><td class="mono">{html.escape(rec['query']) or '(none)'}</td></tr>
+<tr><th>client</th><td class="mono">{html.escape(rec['ip'] or '?')}</td></tr>
+<tr><th>bytes</th><td class="mono">{rec['total']}</td></tr>
+<tr><th>sha256</th><td class="mono">{hashlib.sha256(rec['body']).hexdigest()}</td></tr>
+<tr><th>content-type</th><td class="mono">{html.escape(rec['ctype'] or '(none)')}</td></tr>
+{rows}
+</table>
+<h2>body</h2>
+<pre>{html.escape(hook_body_text(rec))}</pre>""")
+
+
+def hook_list_page():
+    hook_prune()
+    if not HOOK_ORDER:
+        return html_page("webhook inspector", """
+<h1>webhook inspector</h1>
+<p class="muted">Nothing captured yet. POST anything here.</p>
+<pre>curl -s -X POST https://testsites.1110777.xyz/hook \\
+  -H 'Content-Type: application/json' \\
+  -d '{{"hello":"world"}}'</pre>""")
+    rows = "".join(
+        f"<tr><td><a href=\"/hook/{hid}\">{hid}</a></td>"
+        f"<td>{datetime.datetime.fromtimestamp(HOOKS[hid]['at'], datetime.timezone.utc).strftime('%H:%M:%S')}</td>"
+        f"<td>{html.escape(HOOKS[hid]['method'])}</td>"
+        f"<td class='mono'>{html.escape(HOOKS[hid]['path'])}</td>"
+        f"<td>{HOOKS[hid]['total']}</td>"
+        f"<td class='mono'>{html.escape(HOOKS[hid]['ctype'] or '')}</td></tr>"
+        for hid in reversed(HOOK_ORDER) if hid in HOOKS
+    )
+    return html_page("webhook inspector", f"""
+<h1>webhook inspector</h1>
+<p class="muted">Last {len(HOOK_ORDER)} captures, memory only, gone after an hour.
+POST/PUT/PATCH any content type; DELETE removes a capture.</p>
+<table><tr><th>id</th><th>time (UTC)</th><th>method</th><th>path</th><th>bytes</th><th>type</th></tr>{rows}</table>
+<pre>curl -s -X POST https://testsites.1110777.xyz/hook -d 'hello'
+curl -s -X POST 'https://testsites.1110777.xyz/hook?status=204' -d '{{}}'</pre>""")
+
+
+async def hook_capture(reader, writer, headers, method, path, query, qs, head_only):
+    body = bytearray()
+    total = 0
+    try:
+        async for chunk in body_iter(reader, headers):
+            total += len(chunk)
+            if len(body) < HOOK_BODY_MAX:
+                body.extend(chunk[: HOOK_BODY_MAX - len(body)])
+    except (asyncio.TimeoutError, ValueError):
+        pass
+    hid = os.urandom(5).hex()
+    HOOKS[hid] = {
+        "id": hid, "at": time.time(), "method": method, "path": path,
+        "query": query or "",
+        "headers": {k: v for k, v in headers.items()},
+        "body": bytes(body), "total": total, "truncated": total > len(body),
+        "ctype": headers.get("content-type"), "ip": client_ip(headers),
+    }
+    HOOK_ORDER.append(hid)
+    hook_prune()
+    try:
+        code = int((qs.get("status") or ["202"])[0])
+        if not 200 <= code <= 599:
+            code = 202
+    except ValueError:
+        code = 202
+    if code in (204, 304):          # these must not carry a body
+        await respond(writer, code, {}, b"", head_only)
+    else:
+        await json_respond(writer, code, {
+            "id": hid, "url": f"https://{SITE}/hook/{hid}",
+            "bytes": total, "truncated": total > len(body),
+            "expires_in": HOOK_TTL,
+        }, head_only)
+    return {"hook": hid, "bytes": total, "status": code}
+
+
 # ----------------------------------------------------------------- routing ---
 def route(host):
     host = (host or "").split(":")[0].lower().rstrip(".")
@@ -731,14 +972,19 @@ async def handle(reader, writer):
             await writer.drain()
         head_only = method == "HEAD"
 
-        if method not in ("GET", "HEAD", "POST"):
+        is_hook = site == "index" and (path == "/hook" or path.startswith("/hook/"))
+        if method not in ("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"):
             meta["status"] = 405
             await respond(writer, 405, {"Allow": "GET, HEAD, POST"},
                           b"method not allowed\n", head_only)
             return
-        if method == "POST" and site not in ("upload", "gui"):
+        allowed = (method in ("GET", "HEAD")
+                   or (site == "upload" and method in ("POST", "PUT", "PATCH"))
+                   or (site == "gui" and method == "POST")
+                   or (is_hook and method in ("POST", "PUT", "PATCH", "DELETE")))
+        if not allowed:
             meta["status"] = 405
-            await respond(writer, 405, {"Allow": "GET, HEAD"},
+            await respond(writer, 405, {"Allow": "GET, HEAD, POST"},
                           b"method not allowed\n", head_only)
             return
 
@@ -774,6 +1020,44 @@ async def handle(reader, writer):
                 else:
                     # liveness only: no paths, no disk layout, no internals
                     await json_respond(writer, 200, {"ok": True, "ts": now_iso()}, head_only)
+            elif path == "/hook" or path.startswith("/hook/"):
+                hid = path[len("/hook/"):] if path.startswith("/hook/") else ""
+                rec = HOOKS.get(hid) if re.fullmatch(r"[0-9a-f]{10}", hid) else None
+                if method in ("POST", "PUT", "PATCH"):
+                    meta["extra"] = await hook_capture(reader, writer, headers, method,
+                                                      path, parts.query, qs, head_only)
+                    meta["status"] = meta["extra"]["status"]
+                elif method == "DELETE":
+                    existed = HOOKS.pop(hid, None) is not None
+                    if existed and hid in HOOK_ORDER:
+                        HOOK_ORDER.remove(hid)
+                    meta["status"] = 200 if existed else 404
+                    await json_respond(writer, meta["status"], {"deleted": existed}, head_only)
+                elif path in ("/hook", "/hook/"):
+                    page = hook_list_page()
+                    meta["status"] = 200
+                    meta["bytes"] = len(page)
+                    await respond(writer, 200, body=page.encode(), head_only=head_only)
+                elif rec and qs.get("raw"):
+                    meta["status"] = 200
+                    await respond(writer, 200, {
+                        "Content-Type": "text/plain; charset=utf-8",
+                        "Content-Disposition": f'inline; filename="{hid}.txt"',
+                    }, rec["body"], head_only)
+                elif rec:
+                    page = hook_item_page(rec)
+                    meta["status"] = 200
+                    meta["bytes"] = len(page)
+                    await respond(writer, 200, body=page.encode(), head_only=head_only)
+                else:
+                    meta["status"] = 404
+                    await respond(writer, 404, body=b"no such capture\n", head_only=head_only)
+            elif path == "/llms.txt":
+                meta["status"] = 200
+                meta["bytes"] = len(LLMS_TXT)
+                await respond(writer, 200, {"Content-Type": "text/plain; charset=utf-8",
+                                            "Content-Language": "en"},
+                              LLMS_TXT.encode(), head_only=head_only)
             elif path == "/privacy":
                 meta["status"] = 200
                 await respond(writer, 200, body=PRIVACY_HTML.encode(), head_only=head_only)

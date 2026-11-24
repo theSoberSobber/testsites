@@ -49,6 +49,27 @@ Download query params: `bytes`, `infinite`, `chunk`, `pattern=seq|zero|random`,
 `rate` (bytes/sec), `filename=demo.pdf` (sets `Content-Type` and
 `Content-Disposition` from the extension).
 
+## Webhook inspector
+
+`POST https://testsites.1110777.xyz/hook` accepts any method, content type and
+body, and hands back a link that renders it: method, path, query, every header,
+client IP, size, SHA-256 and a pretty-printed (or hex) body.
+
+- first 64 KiB of the body kept, last 50 captures, one hour TTL, memory only
+- `GET /hook` lists captures, `GET /hook/<id>?raw=1` returns the raw body,
+  `DELETE /hook/<id>` removes one
+- `?status=204` makes the capture reply with that status instead of 202
+
+Everything is HTML-escaped before rendering, so a body or header containing
+markup is shown as text. Useful for GitHub, Stripe, or your own webhook senders.
+
+## For agents
+
+`https://testsites.1110777.xyz/llms.txt` describes every endpoint, query
+parameter, limit and example in one plain-text file, in the
+[llms.txt](https://llmstxt.org) shape. It is linked from the footer of every page
+and from the index, so an agent that lands anywhere can find the rest.
+
 ## Logging
 
 Every request is appended to `logs/access.jsonl` (one JSON object per line):
