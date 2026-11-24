@@ -729,6 +729,17 @@ async def handle(reader, writer):
             await writer.drain()
         head_only = method == "HEAD"
 
+        if method not in ("GET", "HEAD", "POST"):
+            meta["status"] = 405
+            await respond(writer, 405, {"Allow": "GET, HEAD, POST"},
+                          b"method not allowed\n", head_only)
+            return
+        if method == "POST" and site not in ("upload", "gui"):
+            meta["status"] = 405
+            await respond(writer, 405, {"Allow": "GET, HEAD"},
+                          b"method not allowed\n", head_only)
+            return
+
         ip = client_ip(headers) or (peer[0] if peer else "unknown")
         if not allow_request(ip):
             meta["status"] = 429
