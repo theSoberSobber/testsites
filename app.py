@@ -294,6 +294,9 @@ GET https://testsites-download.{BASE_DOMAIN}/
 - ?infinite=1 — chunked forever, cut at the cap
 - ?chunk=N (1024..4 MiB), ?pattern=seq|zero|random, ?rate=<bytes per second>
 - ?filename=name.ext sets Content-Disposition
+- ?type=<media type> sends exactly that Content-Type and overrides the filename
+  guess. Shortcuts: json, text, html, csv, xml, pdf, zip, png, jpeg, mp4, bin.
+  Anything that is not `type/subtype[; charset=x]` is ignored (no CRLF tricks).
 
   curl -s -o /dev/null -w '%{{size_download}}\\n' "https://testsites-download.{BASE_DOMAIN}/?bytes=104857600"
 
@@ -401,7 +404,10 @@ head -c 5G /dev/zero | curl -s --data-binary @- {site_url('upload')}
 curl -s "{site_url('download')}?infinite=1" | pv &gt; /dev/null
 
 # exactly 100 MiB
-curl -s -o /dev/null -w '%{{size_download}}\\n' "{site_url('download')}?bytes=104857600"</pre>
+curl -s -o /dev/null -w '%{{size_download}}\\n' "{site_url('download')}?bytes=104857600"
+
+# any Content-Type you like, without a !DOCTYPE in sight
+curl -sI "{site_url('download')}?bytes=1000&type=application/json" | grep -i content-type</pre>
 <p class="muted">New: <a href="/hook">webhook inspector</a> — POST anything,
 get a link that renders it. Memory only, gone in an hour.</p>
 <p class="muted">Pointing an LLM or coding agent at this? Send it to
@@ -561,14 +567,23 @@ async def stream_download(writer, qs, head_only):
 <tr><td>hard caps</td><td>{MAX_STREAM_BYTES // (1024*1024)} MiB per stream, {DL_RATE_MBPS:g} MiB/s shared egress,
 {RATE_MAX} requests/{RATE_WINDOW:.0f}s and {PER_IP_CONN} concurrent per IP</td></tr>
 <tr><td><a href="?bytes=1048576&amp;filename=demo.pdf">?filename=demo.pdf</a></td><td>Content-Type + Content-Disposition from the filename (pdf, zip, mp4, …)</td></tr>
+<tr><td><a href="?bytes=1048576&amp;type=text/csv">?type=text/csv</a></td><td>send any Content-Type you want; overrides the filename guess.
+Shortcuts: json, text, html, csv, xml, pdf, zip, png, jpeg, mp4, bin</td></tr>
 </table>
+<form method="get" action="/">
+<label>Content-Type <input name="type" value="text/plain" size="28"></label>
+<label>bytes <input name="bytes" value="1048576" size="9"></label>
+<button>stream it</button>
+</form>
 <pre>curl -s -o /dev/null -w '%{{size_download}}\\n' "{site_url('download')}?bytes=104857600"
 curl -s "{site_url('download')}?infinite=1" | pv &gt; /dev/null</pre>""")
         await respond(writer, 200, body=body.encode(), head_only=head_only)
         return {"stream": "landing"}
     sent = 0
     filename = safe_filename(qs.get("filename", [""])[0])
-    ctype = (mimetypes.guess_type(filename)[0] if filename else None) or "application/octet-stream"
+    ctype = (sanitize_mediatype(qs.get("type", [""])[0])
+             or (mimetypes.guess_type(filename)[0] if filename else None)
+             or "application/octet-stream")
     headers = {"Content-Type": ctype,
                "Cache-Control": "no-store",
                "X-Accel-Buffering": "no"}
@@ -611,6 +626,26 @@ curl -s "{site_url('download')}?infinite=1" | pv &gt; /dev/null</pre>""")
     except (ConnectionResetError, BrokenPipeError):
         pass
     return {"stream": "finite", "declared": total_target, "bytes_sent": sent, "pattern": pattern}
+
+
+MEDIA_TYPE_RE = re.compile(
+    r"^[A-Za-z0-9!#$&^_.+-]{1,80}/[A-Za-z0-9!#$&^_.+-]{1,80}"
+    r"(?:;\s*charset=[A-Za-z0-9._-]{1,40})?$")
+TYPE_ALIASES = {
+    "json": "application/json", "text": "text/plain; charset=utf-8",
+    "html": "text/html; charset=utf-8", "csv": "text/csv; charset=utf-8",
+    "xml": "application/xml", "pdf": "application/pdf",
+    "zip": "application/zip", "png": "image/png",
+    "jpeg": "image/jpeg", "jpg": "image/jpeg", "mp4": "video/mp4",
+    "bin": "application/octet-stream",
+}
+
+
+def sanitize_mediatype(raw):
+    """Accept ?type= only if it is a real media type: no CRLF, no junk."""
+    mt = (raw or "").strip()
+    mt = TYPE_ALIASES.get(mt.lower(), mt)
+    return mt if MEDIA_TYPE_RE.match(mt) else ""
 
 
 def safe_filename(raw):
